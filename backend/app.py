@@ -24,6 +24,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Callable, Literal
 
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -31,10 +36,6 @@ from fastapi.encoders import jsonable_encoder
 
 from backend.council_time import CouncilTimeModel, approximate_token_count
 
-
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 # round_table.py pulls in heavy optional dependencies (pandas, etc.). During
 # unit tests we don't need the real implementation, so we tolerate import
@@ -2752,13 +2753,11 @@ def list_posts(
         params.append(source)
 
     if date_from:
-        where.append(
-            "(datetime(p.posted_at) >= datetime(?) OR datetime(p.scraped_at) >= datetime(?))"
-        )
+        where.append("(p.posted_at >= ? OR p.scraped_at >= ?)")
         params.extend([date_from, date_from])
 
     if date_to:
-        where.append("(datetime(p.posted_at) < datetime(?) OR datetime(p.scraped_at) < datetime(?))")
+        where.append("(p.posted_at < ? OR p.scraped_at < ?)")
         params.extend([date_to, date_to])
 
     if isinstance(interest_min, (int, float)):
