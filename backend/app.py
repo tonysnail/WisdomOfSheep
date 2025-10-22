@@ -2252,26 +2252,6 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
     }
 
 
-@app.get("/api/council-analysis/{job_id}")
-def get_council_analysis(job_id: str):
-    job = _load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="job-not-found")
-
-    remaining_val = job.get("remaining")
-    msg_parts: List[str] = []
-    if isinstance(remaining_val, (int, float)):
-        remaining_int = max(int(remaining_val), 0)
-        msg_parts.append(f"{remaining_int} remaining")
-    current = str(job.get("current") or "").strip()
-    if current:
-        msg_parts.append(current)
-
-    data = dict(job)
-    data["message"] = " — ".join(part for part in msg_parts if part)
-    return data
-
-
 @app.get("/api/council-analysis/active")
 def get_active_council_analysis():
     with COUNCIL_JOB_LOCK:
@@ -2295,6 +2275,26 @@ def get_active_council_analysis():
         "remaining": job.get("remaining"),
         "interest_min": job.get("interest_min"),
     }
+
+
+@app.get("/api/council-analysis/{job_id}")
+def get_council_analysis(job_id: str):
+    job = _load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job-not-found")
+
+    remaining_val = job.get("remaining")
+    msg_parts: List[str] = []
+    if isinstance(remaining_val, (int, float)):
+        remaining_int = max(int(remaining_val), 0)
+        msg_parts.append(f"{remaining_int} remaining")
+    current = str(job.get("current") or "").strip()
+    if current:
+        msg_parts.append(current)
+
+    data = dict(job)
+    data["message"] = " — ".join(part for part in msg_parts if part)
+    return data
 
 
 @app.post("/api/council-analysis/{job_id}/stop")
@@ -2351,20 +2351,6 @@ def erase_all_council_analysis():
     }
 
 
-@app.get("/api/refresh-summaries/{job_id}")
-def get_refresh_summaries(job_id: str):
-    job = _load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="job-not-found")
-    # return a copy with computed message
-    msg = ""
-    if job.get("total", 0) > 0:
-        msg = f'{job.get("phase", "")} {job.get("done", 0)}/{job.get("total", 0)} — {job.get("current", "")}'
-    data = dict(job)
-    data["message"] = msg.strip()
-    return data
-
-
 @app.get("/api/refresh-summaries/active")
 def get_active_refresh_summaries():
     global ACTIVE_JOB_ID
@@ -2381,6 +2367,20 @@ def get_active_refresh_summaries():
         raise HTTPException(status_code=404, detail="job-not-found")
 
     return {"job_id": job_id, "status": job.get("status"), "total": job.get("total"), "done": job.get("done")}
+
+
+@app.get("/api/refresh-summaries/{job_id}")
+def get_refresh_summaries(job_id: str):
+    job = _load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job-not-found")
+    # return a copy with computed message
+    msg = ""
+    if job.get("total", 0) > 0:
+        msg = f'{job.get("phase", "")} {job.get("done", 0)}/{job.get("total", 0)} — {job.get("current", "")}'
+    data = dict(job)
+    data["message"] = msg.strip()
+    return data
 
 
 @app.post("/api/refresh-summaries/{job_id}/stop")
