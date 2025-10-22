@@ -148,16 +148,80 @@ def _strip_json_comments(text: str) -> str:
     return "".join(out_chars)
 
 
-def _json_loads_allowing_comments(text: str) -> Dict[str, Any]:
-    """Attempt to parse JSON, tolerating ``//`` and ``/* */`` comments."""
+def _patch_malformed_json_tokens(text: str) -> str:
+    """Repair common JSON mistakes emitted by some local models."""
 
-    try:
-        return json.loads(text)
-    except JSONDecodeError:
-        cleaned = _strip_json_comments(text)
-        if cleaned != text:
-            return json.loads(cleaned)
-        raise
+    if not text or '"' not in text:
+        return text
+
+    comparator_pattern = re.compile(
+        r'"([^"\\]+)"\s*(>=|<=|==|!=|>|<)\s*([^,}\]]+)',
+        re.MULTILINE,
+    )
+
+    def _normalise_literal(raw: str) -> str:
+        candidate = raw.strip()
+
+        if candidate.endswith('"') and candidate.count('"') == 1:
+            candidate = candidate[:-1].rstrip()
+
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            return candidate
+
+        if isinstance(parsed, str):
+            return parsed
+
+        return json.dumps(parsed)
+
+    def repl(match: re.Match) -> str:
+        key = match.group(1)
+        comparator = match.group(2)
+        value = _normalise_literal(match.group(3))
+        coerced = comparator + value
+        return f'"{key}": {json.dumps(coerced)}'
+
+    return comparator_pattern.sub(repl, text)
+
+
+def _json_loads_allowing_comments(text: str) -> Dict[str, Any]:
+    """Attempt to parse JSON, tolerating ``//`` comments and fixer rewrites."""
+
+    last_error: Optional[Exception] = None
+
+    def _attempt(candidate: str) -> Optional[Dict[str, Any]]:
+        nonlocal last_error
+        try:
+            return json.loads(candidate)
+        except JSONDecodeError as exc:
+            last_error = exc
+            patched = _patch_malformed_json_tokens(candidate)
+            if patched != candidate:
+                try:
+                    return json.loads(patched)
+                except JSONDecodeError as exc2:
+                    last_error = exc2
+                    return None
+        except Exception as exc:
+            last_error = exc
+        return None
+
+    first_pass = _attempt(text)
+    if first_pass is not None:
+        return first_pass
+
+    cleaned = _strip_json_comments(text)
+    if cleaned != text:
+        second_pass = _attempt(cleaned)
+        if second_pass is not None:
+            return second_pass
+
+    if isinstance(last_error, JSONDecodeError):
+        raise last_error
+    if last_error is not None:
+        raise last_error
+    raise JSONDecodeError("Invalid JSON", text, 0)
 
 
 def _parse_float(x: Any) -> Optional[float]:
