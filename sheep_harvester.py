@@ -51,7 +51,8 @@ from x_scraper import DEFAULT_X_HANDLES, scrape_x_feed
 from stocktwits_scraper import scrape_stocktwits_news
 
 # ==================== Config ====================
-RAW_POSTS_CSV = Path("raw_posts_log.csv")
+REPO_ROOT = Path(__file__).resolve().parent
+RAW_POSTS_CSV = REPO_ROOT / "raw_posts_log.csv"
 RAW_POST_COLUMNS = ["scraped_at", "platform", "source", "post_id", "url", "title", "text"]
 
 # Defaults = your Streamlit settings
