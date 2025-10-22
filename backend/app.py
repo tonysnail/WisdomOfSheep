@@ -70,9 +70,8 @@ except Exception as exc:  # noqa: BLE001
 # Config (env-overridable)
 # =========================
 DB_PATH = ROOT / "council" / "wisdom_of_sheep.sql"
-CSV_PATH = Path(os.getenv("WOS_CSV_PATH", ROOT / "raw_posts_log.csv"))
-TICKERS_DIR = Path(os.getenv("WOS_TICKERS_DIR", ROOT / "tickers"))  # <- your new folder
-os.environ.setdefault("WOS_TICKERS_DIR", str(TICKERS_DIR))
+CSV_PATH = ROOT / "raw_posts_log.csv"
+TICKERS_DIR = ROOT / "tickers"  # <- your new folder
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -117,7 +116,7 @@ ROUND_TABLE_DUMP_DIR = os.getenv("WOS_RUNNER_DUMP_DIR") or None
 ROUND_TABLE_EVIDENCE_LOOKBACK = _env_int("WOS_EVIDENCE_LOOKBACK_DAYS", 120)
 ROUND_TABLE_MAX_EVIDENCE = _env_int("WOS_MAX_EVIDENCE_PER_CLAIM", 3)
 
-CONVO_STORE_PATH = Path(os.getenv("WOS_CONVOS_PATH", ROOT / "convos" / "conversations.sqlite"))
+CONVO_STORE_PATH = ROOT / "convos" / "conversations.sqlite"
 CONVO_MODEL = os.getenv("WOS_CONVO_MODEL", ROUND_TABLE_MODEL)
 
 CONVO_HUB_LOCK = threading.Lock()

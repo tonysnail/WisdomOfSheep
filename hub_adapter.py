@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from typing import List, Optional
 
 from ticker_conversation_hub import (
@@ -13,13 +14,18 @@ from ticker_conversation_hub import (
 )
 
 
+ROOT = Path(__file__).resolve().parent
+DEFAULT_CONVOS_DB = ROOT / "convos" / "conversations.sqlite"
+
+
 class HubClient:
     """Pure-Python interface to the conversation hub for researcher.py."""
 
-    def __init__(self, db_path: str = "convos/conversations.sqlite", model: str = "mistral"):
-        self._db_path = db_path
+    def __init__(self, db_path: str | Path = DEFAULT_CONVOS_DB, model: str = "mistral"):
+        resolved = Path(db_path)
+        self._db_path = str(resolved)
         self._model = model
-        self._store = SQLiteStore(db_path)
+        self._store = SQLiteStore(self._db_path)
 
     @property
     def store(self) -> SQLiteStore:
@@ -65,10 +71,11 @@ class HubClient:
 _local = threading.local()
 
 
-def get_hub(db_path: str = "convos/conversations.sqlite", model: str = "mistral") -> HubClient:
+def get_hub(db_path: str | Path = DEFAULT_CONVOS_DB, model: str = "mistral") -> HubClient:
     hub = getattr(_local, "hub", None)
-    if hub is None or getattr(hub, "_db_path", None) != db_path or getattr(hub, "_model", None) != model:
-        hub = HubClient(db_path=db_path, model=model)
+    resolved = str(Path(db_path))
+    if hub is None or getattr(hub, "_db_path", None) != resolved or getattr(hub, "_model", None) != model:
+        hub = HubClient(db_path=resolved, model=model)
         _local.hub = hub
     return hub
 
