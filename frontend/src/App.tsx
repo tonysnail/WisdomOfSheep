@@ -197,16 +197,16 @@ export default function App() {
       ? councilJob.current_started_at
       : null
   const nowSeconds = Date.now() / 1000
-  const etaElapsedSeconds =
-    etaBaseSeconds != null && etaStartedAt != null ? Math.max(nowSeconds - etaStartedAt, 0) : 0
-  const etaRemainingSeconds =
-    etaBaseSeconds != null && etaStartedAt != null ? Math.max(etaBaseSeconds - etaElapsedSeconds, 0) : null
-  const etaPercent =
-    etaBaseSeconds != null && etaBaseSeconds > 0 && etaStartedAt != null
-      ? Math.max(0, Math.min(100, (etaElapsedSeconds / etaBaseSeconds) * 100))
-      : 0
-  const showEta = councilJobActive
-  const etaDisplayText = showEta ? formatEta(etaRemainingSeconds) : ''
+  const hasEtaTiming = etaBaseSeconds != null && etaStartedAt != null
+  const etaElapsedSeconds = hasEtaTiming ? Math.max(nowSeconds - etaStartedAt, 0) : 0
+  const etaRemainingSeconds = hasEtaTiming && etaBaseSeconds != null
+    ? Math.max(etaBaseSeconds - etaElapsedSeconds, 0)
+    : null
+  const etaPercent = hasEtaTiming && etaBaseSeconds != null && etaBaseSeconds > 0
+    ? Math.max(0, Math.min(100, (etaElapsedSeconds / etaBaseSeconds) * 100))
+    : 0
+  const showEtaBlock = councilJobActive || councilJobId != null || hasEtaTiming
+  const etaDisplayText = councilJobActive ? formatEta(etaRemainingSeconds) : 'idle'
   const councilLastLine = councilLog
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -230,7 +230,7 @@ export default function App() {
     return `${snippet.slice(0, 197)}…`
   }
 
-  const formatEta = (seconds: number | null): string => {
+  function formatEta(seconds: number | null): string {
     if (seconds == null) return 'estimating…'
     if (!Number.isFinite(seconds)) return 'estimating…'
     if (seconds <= 0.5) return '<1s'
@@ -1229,19 +1229,23 @@ export default function App() {
                 </div>
               )}
             </div>
-            {showEta && (
+            {showEtaBlock && (
               <div className="eta-progress-block">
                 <div
-                  className="progress eta"
+                  className={`progress eta${councilJobActive ? '' : ' inactive'}`}
                   title={
                     etaRemainingSeconds != null
                       ? `~${Math.max(Math.round(etaRemainingSeconds), 0)}s remaining`
-                      : 'Estimating time remaining'
+                      : councilJobActive
+                        ? 'Estimating time remaining'
+                        : 'Council analysis idle'
                   }
                 >
                   <div style={{ width: `${etaPercent}%` }} />
                 </div>
-                <div className="muted small eta-text">Time remaining ~ {etaDisplayText}</div>
+                <div className={`muted small eta-text${councilJobActive ? '' : ' inactive'}`}>
+                  Time remaining ~ {etaDisplayText}
+                </div>
               </div>
             )}
           </div>
