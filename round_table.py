@@ -80,6 +80,7 @@ from council.chairman_stage import run_chairman_stage
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "council" / "wisdom_of_sheep.sql"
+RAW_POSTS_CSV = ROOT / "raw_posts_log.csv"
 
 # ===== Trade Signal (Moderator) =====
 
@@ -178,8 +179,8 @@ def get_post_text(post_id: str) -> str:
                 return row[0]
 
     # fallback to raw_posts_log.csv
-    if os.path.exists("raw_posts_log.csv"):
-        df = pd.read_csv("raw_posts_log.csv")
+    if RAW_POSTS_CSV.exists():
+        df = pd.read_csv(RAW_POSTS_CSV)
         row = df.loc[df["post_id"] == post_id]
         if not row.empty:
             return str(row.iloc[0]["text"])
@@ -1554,7 +1555,9 @@ def run_stage(
 
     text = get_post_text(post_id)
     if not text:
-        raise RuntimeError(f"No text available for post {post_id} in DB or raw_posts_log.csv")
+        raise RuntimeError(
+            f"No text available for post {post_id} in DB or {RAW_POSTS_CSV}" 
+        )
 
     results = run_stages_for_post(
         post_id=post_id,
@@ -1651,7 +1654,7 @@ def analyze_post(
 
 
 def run_from_csv_random(
-    csv_path: str = "raw_posts_log.csv",
+    csv_path: str = str(RAW_POSTS_CSV),
     latest: bool = False,
     model: str = "mistral",
     host: str = "http://localhost:11434",
@@ -2313,8 +2316,13 @@ def run_stages_for_post(
 
 def main():
     ap = argparse.ArgumentParser(description="Wisdom of Sheep — Round Table council runner (Ollama)")
-    ap.add_argument("--dummytest", nargs="?", const="raw_posts_log.csv", default=None,
-                    help="Run a one-off test on a CSV (defaults to ./raw_posts_log.csv if path omitted).")
+    ap.add_argument(
+        "--dummytest",
+        nargs="?",
+        const=str(RAW_POSTS_CSV),
+        default=None,
+        help="Run a one-off test on a CSV (defaults to repo_root/raw_posts_log.csv if path omitted).",
+    )
     ap.add_argument("--latest", action="store_true", help="With --dummytest, pick the latest row instead of random.")
     ap.add_argument("--random", action="store_true", help="Explicitly pick random row (default if neither flag).")
     ap.add_argument("--model", default="mistral", help="Ollama model name.")
@@ -2356,7 +2364,12 @@ def main():
             post_id=args.post_id,   # <— NEW
         )
     else:
-        print(json.dumps({"error": "Provide --dummytest to run a standalone check against raw_posts_log.csv"}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {"error": f"Provide --dummytest to run a standalone check against {RAW_POSTS_CSV}"},
+                ensure_ascii=False,
+            )
+        )
         return
 
     print(json.dumps(signal_dict, indent=2 if args.pretty else None, ensure_ascii=False))
