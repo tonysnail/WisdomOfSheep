@@ -351,7 +351,10 @@ details.stage-log pre { margin:8px 0 0; font-size:12px; line-height:1.4; max-hei
 .toolbar-progress-group .progress.eta { width:200px; }
 .toolbar-progress-group .eta-progress-block { display:flex; flex-direction:column; align-items:flex-end; gap:4px; min-width:200px; }
 .progress.eta > div { background:linear-gradient(90deg, #ffb347, #ff6a00); }
+.progress.eta.inactive { opacity:0.35; }
+.progress.eta.inactive > div { background:linear-gradient(90deg, rgba(255, 179, 71, 0.6), rgba(255, 106, 0, 0.6)); }
 .eta-text { text-align:right; font-variant-numeric:tabular-nums; }
+.eta-text.inactive { opacity:0.65; font-style:italic; }
 .toolbar-row.toolbar-slider { gap:16px; }
 .toolbar-row.toolbar-slider label { font-weight:600; display:flex; align-items:center; gap:6px; transition:color 0.2s ease; }
 .toolbar-row.toolbar-slider label.disabled { color:var(--muted); }
