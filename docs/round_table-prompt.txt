@@ -1,0 +1,159 @@
+Round Table – Working Brief
+What this script does
+
+Ingests a single SOURCE POST (usually Reddit).
+
+Runs a multi-role LLM council to extract market-relevant structure.
+
+Normalizes + validates each role’s JSON against Pydantic schemas.
+
+Fuses outputs into a single MODERATOR SIGNAL with an action (e.g., no_trade, monitor, paper_trade).
+
+Emits verbose per-role blocks (*_RAW, *_NORMALIZED, *_VALIDATION) for debugging.
+
+CLI & run modes
+
+Typical call:
+python round_table.py --dummytest --random --model mistral --pretty --verbose
+
+Flags (observed):
+
+--dummytest / --random: pull a random post from a local CSV.
+
+--model: upstream LLM name (e.g., mistral).
+
+--pretty / --verbose: human-friendly printing + full trace.
+
+Pipeline roles (in run order)
+
+ENTITY – light NER:
+
+Extracts assets (tickers/markets), time_hint, uncertainty.
+
+Normalizes tickers (e.g., $DVLT → DVLT; OTC/CSE often kept but downstream may ignore).
+
+SUMMARISER – quick bullets:
+
+summary_bullets, assets_mentioned, claimed_catalysts/risks, numbers_mentioned, author_stance, quality_flags.
+
+CLAIMS – atomic claims:
+
+List of {id, text, type, entity, why} across categories (performance, liquidity, project_status, etc.).
+
+VERIFIER – light check of claims:
+
+Attempts verdicts per claim (supported, refuted, insufficient) with confidence and optional citations.
+
+When empty, we see “Auto-fallback (empty verdicts)” and set all to insufficient.
+
+CONTEXT – background and watchouts:
+
+context_bullets, relevant_history, comparables_or_benchmarks (must be a list, not null), stale_risk_level, watchouts.
+
+FOR – pro case:
+
+bull_points, implied_catalysts, setup_quality (specificity/timeliness/edge), what_would_improve.
+
+AGAINST – contra case:
+
+bear_points, red_flags, data_gaps, optional liquidity_concerns.
+
+DIRECTION – trading read:
+
+implied_direction (long/short/uncertain), timeframe, strength (0–3), tradability with suitable_for and blocking_issues.
+
+MODERATOR SIGNAL – fusion:
+
+Consolidates everything into:
+
+{
+  signal_id, source{type, url, post_id},
+  asset{ticker, market},
+  headline_summary,
+  direction, timeframe, confidence,
+  liquidity_risk, council_scores{information_quality, trade_clarity, evidence_strength, why},
+  rationale[], blocking_issues[], citations[],
+  audit{post_bullets, claims[], context_used[], timestamps{}, why},
+  action: "no_trade" | "monitor" | "paper_trade",
+  next_checks[], why
+}
+
+
+Action mapping (rule-of-thumb):
+
+No explicit US-listed ticker or no claim with direction → no_trade.
+
+Vague/10x hype/multi-ticker polls → monitor at best.
+
+Clean, verifiable catalysts with evidence and clarity → paper_trade.
+
+Validation & normalization
+
+Every role prints three sections: RAW, NORMALIZED, VALIDATION.
+
+If a schema fails, the role retries once; persistent errors bubble up (e.g., comparables_or_benchmarks must be [], not null).
+
+Auto-fix paths normalize booleans/numbers/enums and fill missing why.
+
+Notable behaviors / edge cases
+
+Empty/waffle posts → ENTITY finds none; DIRECTION → uncertain/strength≈1; MODERATOR → no_trade.
+
+Speculative polls (“what 10x?”) → many claims but VERIFIER empty → evidence strength = 0 → monitor or no_trade.
+
+OTC/CSE-only tickers (e.g., ESAUF/ESAU) → not US-listed; even with bullish text, WisdomOfSheep (downstream) won’t fire a signal.
+
+Null vs list: comparables_or_benchmarks: null causes Context validation crash — must be [].
+
+How WisdomOfSheep consumes this
+
+wisdom_of_sheep.py owns the strict signal extractor used operationally:
+
+Emits JSON only if the text contains an explicit directional call for a real US-listed (NYSE/NASDAQ) ticker.
+
+Schema:
+
+{ "tickers": ["..."], "direction": "long|short", "target": float|null, "confidence": 0..1 }
+
+
+Otherwise returns null (spam/OTC/polls/discussion → ignored).
+
+A separate spam detector (outside round_table.py) will run; round_table remains exploratory/diagnostic.
+
+What “trade signal” looks like (for extractor to fire)
+
+Contains US-listed ticker (e.g., NVDA, AAPL, TSLA) and an explicit stance: “long/buy/calls” or “short/puts/sell”.
+
+Optional: target or timeframe raises confidence.
+
+Anything else (opinions, “what’s your favorite?”, OTC/CSE, DD without direction) → no JSON / null.
+
+Common failure modes we’ve already seen
+
+IndentationError during a recent patch (fixed by ensuring an indented block after function defs).
+
+Pydantic error: comparables_or_benchmarks given as null (must be []).
+
+Auto-fallback on VERIFIER → sets all claim verdicts to insufficient; downstream evidence_strength=0.
+
+Ambiguous assets: $CYCU/$ATCH/$NUAI/$DVLT with no direction → monitor/no_trade.
+
+Macro takes (market correction chatter) → no single tradable ticker → no_trade.
+
+Quick tuning knobs (conceptual)
+
+retry_on_invalid per role (currently 1): increase if models are flaky.
+
+Ticker sanitation: tighten normalization to drop non-US tickers earlier if you want less noise.
+
+Moderator thresholds:
+
+Gate paper_trade on (a) US ticker present, (b) direction ≠ uncertain, (c) evidence_strength > 0, (d) information_quality & trade_clarity above cutoffs.
+
+Strict list defaults: force [] for all optional list fields before schema validation.
+
+What to paste when starting a fresh chat
+
+We’re tuning a script called round_table.py that runs a council of LLM roles on a Reddit post and emits a fused MODERATOR SIGNAL with an action (no_trade/monitor/paper_trade). Roles: ENTITY, SUMMARISER, CLAIMS, VERIFIER, CONTEXT, FOR, AGAINST, DIRECTION, MODERATOR. Each role must output valid JSON; schemas reject null for list fields (use []). Posts without an explicit US-listed ticker + direction should not produce a trading signal in wisdom_of_sheep.py (which is stricter and returns JSON only for explicit long/short calls on NYSE/NASDAQ). We’re testing many posts; help me (a) spot why a given item ended as no_trade/monitor/paper_trade, (b) fix schema edge-cases (e.g., null→[]), and (c) refine fusion thresholds so real signals fire only on legit US-ticker directional calls.
+
+If you want, I can also draft a “developer checklist” version (one-pager) you can drop in the repo.

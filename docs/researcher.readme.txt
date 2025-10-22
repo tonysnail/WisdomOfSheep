@@ -1,0 +1,299 @@
+Researcher: Article-Informed Trade Context & Plan
+
+This document explains how researcher.py coordinates a compact, two-stage research workflow that turns one article into an actionable view of the likely post-article price behavior for its ticker. It combines:
+
+a tiny LLM strategy→plan pass (token-lean, session-aware),
+
+technical analysis over recent price history, and
+
+corpus-based sentiment across sector-relevant news (with a terse LLM relevance/direction check).
+
+It produces a normalized JSON bundle you can feed into a trader, scheduler, or moderator.
+
+What we’re trying to decide
+
+“Given this article, is the stock overbought/oversold or otherwise likely to move?
+Should we buy/short now, watch and trade later on triggers, or do nothing?”
+
+Prerequisites & inputs (from round_table.py)
+
+researcher.py reuses precomputed stage outputs stored in the SQL DB by the article analyzer. For the source article, it expects the following to be present in stages:
+
+summariser
+
+summary bullets, spam likelihood
+
+for (from bull_case_stage.py)
+
+bull_points, implied_catalysts, setup_quality (evidence_specificity, timeliness, edge_vs_consensus)
+
+against (from bear_case_stage.py)
+
+bear_points, red_flags, data_gaps, liquidity_concerns
+
+If any are missing for the source or for corpus candidates inside the lookback window, researcher.py can call the corresponding per-stage runners (same mechanism as round_table.py does) and will store the results back into the DB to keep the pipeline deterministic and cache-friendly.
+
+Minimum DB fields used: posts.(post_id, posted_at/scraped_at, text/title/url), stages.(post_id, stage, payload).
+
+Tool palette the LLM can plan with
+
+The LLM never sees raw price data; it only plans which tools to call. researcher.py then executes those tools locally.
+
+Timing (exactly one):
+
+price_window — {"ticker":"T","from":"YYYY-MM-DD","to":"YYYY-MM-DD","interval":"1d"}
+
+Technical (≥1):
+
+compute_indicators — {"ticker":"T","window_days":N} → RSI, MACD, BB, ATR, 20/50 SMA/EMA, etc.
+
+trend_strength — {"ticker":"T","lookback_days":N} → ADX-like / slope & persistence score.
+
+volatility_state — {"ticker":"T","days":N,"baseline_days":M} → elevated/normal/contracting.
+
+support_resistance_check — {"ticker":"T","days":N} → levels + distance %.
+
+bollinger_breakout_scan — {"ticker":"T","days":N} → upper/lower pierce, squeeze context.
+
+obv_trend — {"ticker":"T","lookback_days":N} → accumulation/distribution bias.
+
+mfi_flow — {"ticker":"T","period":N} → money-flow overbought/oversold regime.
+
+Sentiment (≥1):
+
+news_hub_score — {"ticker":"T","as_of":"ISO","days":N,"channel":"all|news|social","peers":["T1","T2"],"burst_hours":N} → DES-style score using pre-ingested deltas and optional sector peers.
+
+news_hub_ask_as_of — {"ticker":"T","as_of":"ISO","q":"short question"} → retrieves as-of-safe chat context and asks the local model for a concise narrative.
+
+All technical tools are implemented in technical_analyser.py and use stock_window.py under the hood when they need historical prices.
+The sentiment tool is implemented in corpus_sentiment_analyser.py and uses tickers/tickers_enriched.csv for sector mapping.
+
+End-to-end flow
+                ┌─────────────────────────────────────────────────────────┐
+                │                  SQL database (stages)                   │
+                │ source: summariser, for, against  | corpus: cached runs │
+                └─────────────────────────────────────────────────────────┘
+                                   ▲                   ▲
+                                   │ ensures/loads     │ ensures/loads
+                                   │                   │
+┌───────────────┐     Stage 1      │        Stage 2    │      Exec + Score
+│   researcher  │ ──► Hypotheses ──┼──► Plan (3–5 steps) ──► Tools (tech + sent)
+└───────────────┘   (balanced)     │    (coverage rule)     + aggregation
+                                   │
+                                   ▼
+                         JSON results + logs
+
+Stage 1 — Balanced hypotheses (tiny)
+
+Input: source summariser, for, against payloads.
+
+Output: 2–3 non-duplicate hypotheses (≤20 words) covering both continuation and reversion, each labeled with type (continuation|reversion) + one-line rationale.
+
+Token discipline: only the salient bullets and council snippets are passed.
+
+Stage 2 — Minimal plan (tiny)
+
+Input: hypotheses from Stage-1 (remembered via session), article timestamp, fixed coverage rules.
+
+Output: 3–5 steps, each:
+{tool, args, covers:["timing"|"technical"|"sentiment"], tests:[indices into hypotheses], pass_if, fail_if, why}
+
+Coverage constraint: exactly one timing, ≥1 technical, ≥1 sentiment.
+
+Args are validated against strict schemas; dates are anchored to ARTICLE_TIME_UTC.
+
+Execution — Run tools & assemble signals
+
+Technical metrics are computed via technical_analyser.py (single import).
+
+Sentiment is computed via corpus_sentiment_analyser.py:
+
+Sector-aware corpus scan (spam ≤ threshold),
+
+Base score from FOR/AGAINST payloads,
+
+LLM micro-pass (Ollama mistral) for relevance+direction vs source bullets, cached as stages.stage='corpus_llm_sent'.
+
+Aggregation — Scores & decision
+
+Normalize technical sub-signals to [-1, +1] and blend to S_tech.
+
+Use corpus output for S_sent (base+LLM weighted averages).
+
+Combine with a simple convex blend (defaults):
+S_total = 0.55 * S_tech + 0.45 * S_sent
+
+Produce action guidance:
+
+Buy now if S_total ≥ +0.35, breakout/trend confirm, sentiment ≥ 0.
+
+Short now if S_total ≤ −0.35, breakdown/trend confirm, sentiment ≤ 0.
+
+Watchlist w/ triggers if |S_total| < 0.35 or tech & sent disagree.
+
+No trade if signal quality low (e.g., spam-heavy, few posts, conflicting levels).
+
+Thresholds are configurable in researcher.py flags/env.
+
+Running the process
+
+Typical usage:
+
+# Minimal: run full researcher on an article’s ticker/time
+python3 researcher.py \
+  --db ./council/wisdom_of_sheep.sql \
+  --tickers-csv ./tickers/tickers_enriched.csv \
+  --ticker HOOD \
+  --article-time 2025-09-29T22:51:08Z \
+  --lookback-days 3 \
+  --session wos-HOOD-<random>
+
+
+Useful knobs:
+
+--spam-threshold 30 (drop >30% spam)
+
+--timing-window 2025-09-26,2025-09-29
+
+--tech-lookbacks 20,40,60
+
+--sent-lookback 7
+
+--ollama-model mistral (default)
+
+--pretty (pretty-print JSON)
+
+The script prints clearly delimited console logs:
+
+================================================================================
+🧠  LLM CALL → Stage 1: Strategy (model=mistral, session=wos-HOOD-…)
+...
+================================================================================
+🧠  LLM CALL → Stage 2: Plan (model=mistral, session=wos-HOOD-…)
+...
+################################################################################
+✅ FINAL RESULTS
+################################################################################
+...
+
+What the output looks like (shape)
+
+High-level JSON envelope:
+
+{
+  "ticker": "HOOD",
+  "article_time_utc": "2025-09-29T22:51:08Z",
+  "session": "wos-HOOD-…",
+  "strategy": {
+    "hypotheses": [
+      {"text":"…","type":"continuation"},
+      {"text":"…","type":"reversion"}
+    ],
+    "rationale":"…",
+    "why":"…"
+  },
+  "plan": {
+    "steps": [
+      {
+        "tool":"price_window",
+        "args":{"ticker":"HOOD","from":"2025-09-26","to":"2025-09-29","interval":"1d"},
+        "covers":["timing"],
+        "tests":[0],
+        "pass_if":"window complete",
+        "fail_if":"window incomplete",
+        "why":"…"
+      },
+      {"tool":"compute_indicators","args":{"ticker":"HOOD","window_days":60},"covers":["technical"],"tests":[1], "pass_if":"RSI/MACD computed","fail_if":"indicators failed","why":"…"},
+      {"tool":"news_hub_score","args":{"ticker":"HOOD","as_of":"2025-09-29T22:51:08Z","days":7,"channel":"all","peers":[],"burst_hours":6},"covers":["sentiment"],"tests":[1], "pass_if":"3-day sentiment slope positive","fail_if":"Sentiment turns negative","why":"…"}
+    ],
+    "why": "coverage rule satisfied"
+  },
+  "technical": {
+    "indicators": {"rsi": 62.1, "macd": {"value": 0.55, "signal": 0.31}, "bb": {"squeeze": false, "z": 1.1}, ...},
+    "trend_strength": {"score": 0.48, "method":"slope+adx"},
+    "volatility_state": {"state":"elevated","atr_pcnt": 3.2, "vs_baseline": "+1.4σ"},
+    "support_resistance": {"nearest_support": -3.8, "nearest_resistance": +2.1, "why":"…"},
+    "breakouts": {"bollinger": "upper_pierce", "why":"…"},
+    "volume_flows": {"obv_slope": "up", "mfi": 68}
+  },
+  "sentiment": {
+    "series_sector": [{"day":"2025-09-27","posts":12,"avg_combined":0.21}, ...],
+    "series_ticker": [{"day":"2025-09-29","posts":3,"avg_combined":0.36}],
+    "top_positive_posts": [...],
+    "top_negative_posts": [...],
+    "weights": {"w_base":0.6,"w_llm":0.4},
+    "llm": {"enabled": true, "model": "mistral", "calls": 7, "cached": 15}
+  },
+  "scores": {
+    "tech": 0.44,
+    "sent": 0.28,
+    "total": 0.37,
+    "quality": {"coverage_ok": true, "sample_ok": true, "notes": []}
+  },
+  "decision": {
+    "action": "buy_now | short_now | watch | no_trade",
+    "triggers": [
+      "close > last_resistance & trend_strength>0.4",
+      "sentiment 7d rising"
+    ],
+    "risk": {"stop_pct": 4.0, "size_hint": "small/medium"},
+    "why": "one-liner tying signals to action"
+  }
+}
+
+How to use the results
+1) Buy / Short now
+
+When: scores.total strong (|≥0.35|), price confirms (breakout/breakdown), trend_strength supports direction, sentiment not contradicting.
+
+Trade idea: enter with small–medium size, stop beyond nearest level, optionally scale on confirmation.
+
+2) Watch & schedule
+
+When: mixed signals or early setup; e.g., positive sentiment but price below resistance; or strong tech with flat sentiment.
+
+Action: save triggers from decision.triggers into your scheduler/automations (e.g., alert if close > level, or if 7-day sentiment crosses zero).
+
+3) No trade
+
+When: low sample (few posts), spam-heavy, or scores.quality.coverage_ok==false; technicals are noisy/contradictory and sentiment is neutral or conflicting.
+
+The decision rationale is always a one-liner, and the triggers are explicit so you can automate alerts.
+
+Implementation details worth noting
+
+Session memory: Stage-1 hypotheses are carried into Stage-2 using a session id so the planner can reference them (tests indexes).
+
+Token economy: We pass only summary bullets + council points; the prompts are strict JSON; Stage-2 is capped at 3–5 steps.
+
+Caching:
+
+All per-post stages (summariser/for/against) are persisted.
+
+The corpus LLM pass (relevance/direction) is cached as stages.stage='corpus_llm_sent'.
+
+Sector mapping: Uses tickers/tickers_enriched.csv to decide which corpus posts are relevant; broad market posts without tickers can still be judged by the LLM pass.
+
+Safety rails: Spam filter (default >30% drop), interval degradation in stock_window.py, and schema checks on tool args.
+
+Extending the system
+
+Add a new technical measure? Implement it in technical_analyser.py, expose a 1-line schema, add to the palette.
+
+Want stronger/stricter actions? Adjust the thresholds and the weights (--tech-weight, --sent-weight, etc.).
+
+Need slower memory decay in sentiment? Increase --lookback-days and consider decaying weights by recency in the corpus module.
+
+TL;DR
+
+researcher.py turns one article into:
+
+a balanced thesis,
+
+a tiny tool plan,
+
+concrete technical + sentiment signals, and
+
+a clear trade decision with optional triggers.
+
+It’s fast, reproducible, and focused on the only thing that matters: “What should we do with this ticker, and why?”

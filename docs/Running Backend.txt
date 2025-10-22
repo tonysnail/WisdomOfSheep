@@ -1,0 +1,26 @@
+
+Running the Wisdom Of Sheep frontend.
+
+
+We're using React to interact with the SQL database. The backend invokes the Round Table pipeline directly via Python imports (no subprocesses) to perform LLM analysis and update the database.
+
+Backend configuration highlights:
+
+* `WOS_MODEL_NAME` — Ollama model slug passed to `round_table.run_stages_for_post` (default `mistral`).
+* `WOS_MODEL_HOST` — Ollama server URL (default `http://localhost:11434`).
+* `WOS_MODEL_TIMEOUT_SECS` — per-call timeout; set `0` or negative to disable.
+* `WOS_RUNNER_VERBOSE` — set to `0`/`false` to silence verbose Round Table logs (default on).
+* `WOS_EVIDENCE_LOOKBACK_DAYS`, `WOS_MAX_EVIDENCE_PER_CLAIM` — evidence corpus tuning knobs.
+
+
+To run the Backend (SQL / Python):
+
+cd backend
+uvicorn app:app --reload --port 8000
+
+
+To run the Frontend (web server)
+cd frontend
+npm run dev
+
+
