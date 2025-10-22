@@ -2501,11 +2501,13 @@ def list_posts(
         params.append(source)
 
     if date_from:
-        where.append("(p.posted_at >= ? OR p.scraped_at >= ?)")
+        where.append(
+            "(datetime(p.posted_at) >= datetime(?) OR datetime(p.scraped_at) >= datetime(?))"
+        )
         params.extend([date_from, date_from])
 
     if date_to:
-        where.append("(p.posted_at < ? OR p.scraped_at < ?)")
+        where.append("(datetime(p.posted_at) < datetime(?) OR datetime(p.scraped_at) < datetime(?))")
         params.extend([date_to, date_to])
 
     if isinstance(interest_min, (int, float)):
