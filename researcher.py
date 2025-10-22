@@ -11,6 +11,10 @@ Stages:  1) Balanced hypotheses  2) Tool plan (timing + technical + sentiment)
 import json, os, re, uuid, requests
 from datetime import datetime, timedelta, timezone, date
 from textwrap import indent
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+DEFAULT_CONVOS_DB = ROOT / "convos" / "conversations.sqlite"
 
 
 
@@ -32,10 +36,10 @@ def log_event(message: str) -> None:
     print(f"[{_ts()}] {message}")
 
 # ------------------------------- Utilities -----------------------------------
-def get_hub(*, db_path: str = "convos/conversations.sqlite", model: str = MODEL):
+def get_hub(*, db_path: str | Path = DEFAULT_CONVOS_DB, model: str = MODEL):
     from hub_adapter import HubClient
     # construct a NEW client (and therefore a NEW sqlite3 connection) each call
-    return HubClient(db_path=db_path, model=model)
+    return HubClient(db_path=str(Path(db_path)), model=model)
     
 def extract_json_block(s: str):
     if not s: return None
@@ -372,7 +376,7 @@ def execute_plan_steps(steps):
         return results
 
     # Build a fresh hub *in this thread* (no globals / no caching).
-    hub = get_hub(db_path="convos/conversations.sqlite", model=MODEL)
+    hub = get_hub(db_path=DEFAULT_CONVOS_DB, model=MODEL)
 
     # Optional: collect a tiny trace for debugging
     trace = []

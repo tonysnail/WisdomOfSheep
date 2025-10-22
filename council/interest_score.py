@@ -35,6 +35,8 @@ HERE = Path(__file__).resolve()
 REPO_ROOT = HERE.parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+COUNCIL_DB_PATH = REPO_ROOT / "council" / "wisdom_of_sheep.sql"
+CONVOS_DB_PATH = REPO_ROOT / "convos" / "conversations.sqlite"
 try:
     import technical_analyser as ta
 except Exception:
@@ -625,9 +627,15 @@ def compute_interest_for_post(
         When ``True`` (default) the result is written to ``council_stage_interest``.
     """
 
-    db_path_str = str(db_path or os.getenv("WOS_DB", "council/wisdom_of_sheep.sql"))
-    conv_path = conv_db_path if conv_db_path is not None else os.getenv("WOS_CONV_DB", "convos/conversations.sqlite")
-    conv_path_str = str(conv_path) if conv_path else None
+    resolved_db_path = Path(db_path) if db_path is not None else COUNCIL_DB_PATH
+    db_path_str = str(resolved_db_path)
+
+    if conv_db_path is None:
+        conv_path_candidate: Optional[Path] = CONVOS_DB_PATH
+    else:
+        conv_text = str(conv_db_path).strip()
+        conv_path_candidate = Path(conv_text) if conv_text else None
+    conv_path_str = str(conv_path_candidate) if conv_path_candidate else None
 
     ticker_value: Optional[str] = None
     spam_pct: int = 0
@@ -812,12 +820,10 @@ def _build_argparser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_argparser().parse_args()
     post_id = args.post_id
-    db_path = os.getenv("WOS_DB", "council/wisdom_of_sheep.sql")
-
     result = compute_interest_for_post(
         post_id,
-        db_path=db_path,
-        conv_db_path=os.getenv("WOS_CONV_DB", "convos/conversations.sqlite"),
+        db_path=COUNCIL_DB_PATH,
+        conv_db_path=CONVOS_DB_PATH,
         persist=True,
     )
 
