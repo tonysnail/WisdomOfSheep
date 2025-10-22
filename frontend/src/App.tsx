@@ -354,10 +354,12 @@ export default function App() {
       return base
     }
 
-    const start = new Date(selectedDate)
-    start.setHours(0, 0, 0, 0)
-    const end = new Date(selectedDate)
-    end.setHours(23, 59, 59, 999)
+    const year = selectedDate.getFullYear()
+    const month = selectedDate.getMonth()
+    const day = selectedDate.getDate()
+
+    const start = new Date(Date.UTC(year, month, day))
+    const end = new Date(start.getTime() + 24 * 60 * 60 * 1000)
 
     return {
       ...base,
