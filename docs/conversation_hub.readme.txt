@@ -1,0 +1,295 @@
+Ticker Conversation Hub — Updated README (Wisdom of Sheep)
+
+This module turns your news corpus into per-ticker rolling “brains.” Each article becomes a tiny delta (a compressed, channel-tagged bulletin) stored in a monolithic SQLite DB. You can:
+
+Ingest new articles incrementally (idempotent).
+
+Query latest or time-travel with an as-of cutoff (no future leakage).
+
+Score a ticker into a tradable metric: Directional Evidence Score (DES) with confidence.
+
+Keep social chatter (Reddit/X/Stocktwits) and news, with channel awareness and burst amplification.
+
+What gets stored
+Delta (per article → per involved ticker)
+
+Compact, model-generated summary (local Ollama; default mistral) with a stable JSON schema:
+
+{
+  "t": "2025-10-13T10:22:00+00:00",          // article time (posted_at preferred; else scraped_at)
+  "src": "rss:nasdaq",                       // short source tag
+  "who": ["HOOD","AAPL"],                    // tickers involved (first is PRIMARY for the wording)
+  "cat": ["product","ops","risk"],           // reg|product|earnings|macro|legal|ops|risk|m&a|comp
+  "sum": "2–3 compact sentences explaining what happened and why it matters to the PRIMARY ticker.",
+  "dir": "up",                               // up|down|neutral|uncertain
+  "impact": "med",                           // low|med|high
+  "why": "feature launch boosts engagement", // ≤ 12 words
+  "url": "https://example.com/post",
+  "chan": "news"                             // news|social|other (hub-side tag)
+}
+
+
+Prompt tweak (already in script): “2–3 compact sentences: (1) what happened; (2) why it matters to the PRIMARY ticker; (3) optional near-term setup/constraint.”
+Channel tag: We add chan ourselves (no extra LLM tokens) by classifying source/url into news|social|other.
+
+Memory (rollup)
+
+Created by rollup to summarize older history into a small “note”:
+
+{
+  "t": "2025-10-13T11:05:12+00:00",
+  "note": "- Options product push; engagement up...\n- Compliance chatter persists...",
+  "range": {"start": "2025-09-01T00:03:12+00:00", "end": "2025-10-10T21:44:09+00:00"}
+}
+
+
+Only memories with range.end ≤ as_of are included in backtests (no leakage).
+
+Storage (SQLite recommended)
+
+Single DB file: convos/conversations.sqlite.
+
+conversations(id, ticker, ts, kind, data)
+
+kind ∈ {'delta','memory'}
+
+data is the JSON for that record (see above)
+
+convo_index(ticker PRIMARY KEY, last_ts) – for incremental gating
+
+Index: idx_conv_ticker_ts(ticker, ts) – fast range reads
+
+JSONL backend also exists (good for debugging), but SQLite is preferred for ops and backups.
+
+Pipeline (how it works)
+
+Input (from your posts table, after Summarise Posts stage):
+
+title, text, posted_at/scraped_at, source/platform, url
+
+stages.summariser.payload with summary_bullets and assets_mentioned[{ticker}]
+
+Compression: One LLM call per article to produce a single delta JSON (reused across all tickers in who).
+
+Channel tag: Hub classifies each delta as news|social|other and persists it in chan.
+
+Fan-out & idempotency:
+
+For each ticker in who: if t > last_ts(ticker) → ADD; else SKIP.
+
+Logs show every ADD/SKIP with timestamps and clipped summaries.
+
+Rollups (optional): Summarize older deltas into a memory with a covered {start,end} range.
+
+Querying the hub
+Natural Q&A (latest)
+python ticker_conversation_hub.py ask \
+  --ticker HOOD \
+  --q "What catalysts are in play right now?" \
+  --store sqlite --convos convos/conversations.sqlite --model mistral
+
+Time-travel Q&A (backtesting, no leakage)
+python ticker_conversation_hub.py ask-as-of \
+  --ticker HOOD \
+  --as-of 2025-09-29T23:59:59+00:00 \
+  --q "What was the tone around options revenue then?" \
+  --store sqlite --convos convos/conversations.sqlite --model mistral
+
+
+Loads only deltas with t ≤ as_of and memories with range.end ≤ as_of.
+
+Injects an AS_OF cutoff instruction into the system prompt.
+
+Scoring: tradable metric for the bot
+
+Directional Evidence Score (DES) in [-1, +1], plus confidence in [0,1].
+
+Map per-delta direction: up=+1, down=-1, neutral/uncertain=0
+
+Weight by:
+
+Recency: exp(-λ·age_days) with λ=0.12 (half-life ≈ 5.8d)
+
+Impact: low=0.6, med=1.0, high=1.4
+
+Channel burst (social only): amplify when many social deltas occur in a short window (default last 6h)
+
+Aggregate to des_raw, compute peer/sector baseline (optional) → des_sector, then:
+
+des_idio = des_raw - des_sector
+
+Confidence combines coverage (effective sample size) and agreement (low variance ↑ confidence)
+
+Score CLI
+
+Blended (all channels):
+
+python ticker_conversation_hub.py score \
+  --ticker HOOD \
+  --as-of 2025-09-29T23:59:59+00:00 \
+  --days 7 \
+  --store sqlite --convos convos/conversations.sqlite \
+  --channel all
+
+
+News vs Social:
+
+# News-only
+python ticker_conversation_hub.py score \
+  --ticker HOOD --as-of 2025-09-29T23:59:59+00:00 --days 7 \
+  --store sqlite --convos convos/conversations.sqlite --channel news
+
+# Social-only with burst sensitivity
+python ticker_conversation_hub.py score \
+  --ticker HOOD --as-of 2025-09-29T23:59:59+00:00 --days 3 \
+  --store sqlite --convos convos/conversations.sqlite \
+  --channel social --burst-hours 6
+
+
+With peers for a sector baseline:
+
+python ticker_conversation_hub.py score \
+  --ticker HOOD --as-of 2025-09-29T23:59:59+00:00 --days 7 \
+  --store sqlite --convos convos/conversations.sqlite \
+  --channel all --peers "COIN,SOFI"
+
+
+Example output
+
+{
+  "ticker": "HOOD",
+  "as_of": "2025-09-29T23:59:59+00:00",
+  "window_days": 7,
+  "channel": "all",
+  "burst_hours": 6,
+  "signal": {
+    "des_raw": 0.31,
+    "des_sector": 0.12,
+    "des_idio": 0.19,
+    "confidence": 0.64,
+    "n_deltas": 42
+  }
+}
+
+
+Bot tip: Use DES_adj = des_idio * confidence as a guard; require minimum coverage (n_deltas ≥ 3 or ESS ≥ 3) before acting. Blend with technicals + source-post council vote.
+
+CLI — ingest & maintenance
+Ingest the entire DB (idempotent)
+python ticker_conversation_hub.py ingest \
+  --db council/wisdom_of_sheep.sql \
+  --store sqlite --convos convos/conversations.sqlite \
+  --model mistral --verbose
+
+Roll up older context
+python ticker_conversation_hub.py rollup \
+  --ticker HOOD --keep-latest 300 \
+  --store sqlite --convos convos/conversations.sqlite \
+  --model mistral --verbose
+
+Python API (integrate with “Summarise Posts”)
+from ticker_conversation_hub import ConversationHub, SQLiteStore
+
+hub = ConversationHub(store=SQLiteStore("convos/conversations.sqlite"), model="mistral")
+
+# After your Summarise Posts stage persists summary_bullets and assets_mentioned:
+hub.ingest_article(
+    tickers=["HOOD","AAPL"],  # from summariser (preferred) or cashtags fallback
+    title="Robinhood launches multi-leg options",
+    bullets=[
+        "Adds multi-leg strategies; staged rollout",
+        "New risk checks for options traders"
+    ],
+    url="https://example.com/post",
+    ts="2025-10-13T10:22:00+00:00",  # posted_at preferred, else scraped_at
+    source="rss:nasdaq",
+    verbose=True
+)
+
+# Compute bot-ready metric (blended, sector-neutralized via peers)
+signal = compute_ticker_signal(
+    store=hub.store,
+    ticker="HOOD",
+    as_of_iso="2025-10-13T23:59:59+00:00",
+    lookback_days=7,
+    peers=["COIN","SOFI"],
+)
+
+
+Where to call from Summarise Posts
+
+The post is detected as new.
+
+stages.summariser is saved with summary_bullets and assets_mentioned.
+
+(Optional) Spam threshold passed.
+
+Call hub.ingest_article(...).
+
+Backtesting: why it’s leakage-safe
+
+We hard-filter records at read time: deltas t ≤ as_of, memories with range.end ≤ as_of.
+
+We hint the cutoff in the system prompt for Q&A.
+
+Scoring uses the same pre-cutoff filter (no model calls required).
+
+Tip: During backtests, run in read-only mode (don’t ingest) to keep last_ts stable.
+
+Operational notes
+
+Model: Local Ollama (mistral by default). HTTP /api/chat first; fallback to ollama run if HTTP is unavailable.
+
+Verbosity: --verbose on ingest prints per-post headers and per-ticker ADD/SKIP lines with timestamps and clipped summaries.
+
+Social is kept (by design). We tag chan and apply burst weighting so hype only matters when crowds surge.
+
+Performance: One LLM call per article, not per ticker. All scoring is light, purely from stored deltas.
+
+Backups: Just back up convos/conversations.sqlite. Use VACUUM occasionally if it grows large.
+
+Data hygiene: Guard against empty/invalid tickers prior to ingest; verify ts is ISO8601; keep ticker strings uppercase/alnum.
+
+Troubleshooting
+
+No deltas appended
+Check summariser exists; ensure assets_mentioned[].ticker or cashtags fallback populated; ensure ts > last_ts(ticker).
+
+Low coverage / low confidence
+Widen --days or include peers for the baseline; expect confidence to climb as deltas accumulate.
+
+Weird symbols (e.g., futures, FX)
+That’s OK if intentional. If not, add a small whitelist/blacklist in your ingest to constrain to equities/ETFs.
+
+Future leakage suspicion
+Use ask-as-of; confirm memories have range.end ≤ as_of; confirm score --as-of produces sensible counts.
+
+Quick reference
+# Ingest (monolithic SQLite store)
+python ticker_conversation_hub.py ingest --db council/wisdom_of_sheep.sql \
+  --store sqlite --convos convos/conversations.sqlite --model mistral --verbose
+
+# Q&A (latest)
+python ticker_conversation_hub.py ask --ticker NVDA --q "What catalysts are in play right now?" \
+  --store sqlite --convos convos/conversations.sqlite --model mistral
+
+# Q&A (as-of; backtest-safe)
+python ticker_conversation_hub.py ask-as-of --ticker HOOD \
+  --as-of 2025-09-01T00:00:00+00:00 \
+  --q "What risks were present then?" \
+  --store sqlite --convos convos/conversations.sqlite --model mistral
+
+# Bot metric (blended)
+python ticker_conversation_hub.py score --ticker HOOD \
+  --as-of 2025-09-29T23:59:59+00:00 --days 7 \
+  --store sqlite --convos convos/conversations.sqlite --channel all
+
+# Bot metric (news-only vs social-only)
+python ticker_conversation_hub.py score --ticker HOOD \
+  --as-of 2025-09-29T23:59:59+00:00 --days 7  --channel news
+python ticker_conversation_hub.py score --ticker HOOD \
+  --as-of 2025-09-29T23:59:59+00:00 --days 3  --channel social --burst-hours 6
+
+# Roll up older history
+python ticker_conversation_hub.py rollup --ticker AAPL --keep-latest 300 \
+  --store sqlite --convos convos/conversations.sqlite --model mistral --verbose

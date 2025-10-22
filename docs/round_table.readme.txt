@@ -1,0 +1,391 @@
+Wisdom of Sheep — Round Table (Ollama + Council + CSV Evidence)
+
+round_table.py turns messy crowd posts (Reddit/Stocktwits/RSS/X) into a normalized trading signal you can use for auto-trading and backtesting.
+It runs a small “council” of LLM roles (via Ollama) with strict JSON schemas, repairs/normalizes the outputs with Pydantic v2, and fuses everything into a single TradeSignal record.
+
+Highlights
+
+End-to-end pipeline: entity detection → summariser → claims → verifier (on your CSV evidence) → context → “for/against” → direction/timeframe → TradeSignal.
+
+Strict schemas + auto-repair: every role returns machine-readable JSON; coercion and penalties reduce hallucination/format drift.
+
+Evidence-aware: claims are checked against a local CSV (raw_posts_log.csv) so verdicts are grounded in things you’ve scraped already.
+
+Actionable output: TradeSignal includes direction, timeframe, confidence, liquidity_risk.spread_pct, council_scores, action, and an audit block.
+
+1) What the script consumes
+A. Source post (string)
+
+You can pass any text blob (title + body). For CLI “dummy” tests, the script will pick a row from a CSV (see below).
+
+B. CSV evidence (raw_posts_log.csv)
+
+Used by the verifier to ground claims. Expected columns:
+
+column  type    notes
+scraped_at  str ISO-ish timestamp; parsed as UTC when possible
+platform    str reddit, rss, stocktwits, or x
+source  str Optional source name
+post_id str Platform post id (if any)
+url str Link to the item
+title   str Title/headline
+text    str Body
+
+The verifier searches the last N days (configurable) and requires a hit on an alias (ticker or entity name) before considering an item as evidence.
+
+2) The pipeline (how text becomes a signal)
+
+All LLM calls go through Ollama with format="json", strict schema hints, plus a repair/retry loop.
+Each role’s JSON is normalized and validated with Pydantic v2.
+
+Post Text
+  └─► entity       → assets + time intent (EntityTimeframeOut)
+  └─► summariser   → bullets, stance, numbers/spread hints (SummariserOut)
+  └─► claims       → checkable statements (ClaimsOut)
+  └─► verifier     → verdicts per-claim using CSV evidence (VerifierOut)
+  └─► context      → stale risk, neutral background (ContextOut)
+  └─► for/against  → bull vs bear analysis + setup quality
+  └─► direction    → implied direction/timeframe/tradability
+        ▼
+     fuse_moderator → TradeSignal (normalized, penalized, auditable)
+
+Normalization & Repair
+
+Enums are coerced (e.g., “daytrade” → intraday, “bullish” → up).
+
+Missing why fields are auto-filled and penalized.
+
+Tickers like $NIO, NASDAQ:NIO, or NIO.N are cleaned to ticker + market.
+
+Numbers like “2.3 %” normalize to value="2.3", unit="%".
+
+The verifier’s “citations” block is normalized whether the model called it evidence or citations.
+
+Evidence building (CSV)
+
+For each claim, we:
+
+Build aliases (upper-case tickers found in the claim text, ($TICKER), NASDAQ: TICKER, plus entity names).
+
+Search the joined title+text body (time-filtered by lookback days).
+
+Require at least one alias hit.
+
+Score by term hits; take top-K unique URLs.
+
+Provide snippets centered on matched terms.
+
+Penalties (applied to Council scores)
+
+To discourage sloppy/empty JSON:
+
+Top-level why auto-fixed → –10 information_quality (capped).
+
+Missing inner why after retries → –5 information_quality & –5 trade_clarity (capped).
+
+Verifier verdicts with no citations → –10 evidence_strength (capped).
+
+Council why is rebuilt after penalties so the numbers reflect reality.
+
+3) The output: TradeSignal
+
+A single, compact object suitable for trading bots and backtests.
+
+{
+  "signal_id": "reddit_1a2b3c4d5e",
+  "source": {"type":"reddit","post_id":"abc123","url":"https://..."},
+  "asset": {"ticker":"NIO","market":"NYSE"},
+  "headline_summary": "Council assessment based on post text, local evidence, and context.",
+  "direction": "up",                          // up | down | none | uncertain
+  "timeframe": "swing_days",                  // intraday | swing_days | swing_weeks | multi_months | long_term | uncertain
+  "confidence": 0.42,                         // 0..1 (currently heuristic; you can rescale)
+  "liquidity_risk": {"spread_pct": 0.013, "note":"Bid/Ask mentioned in post"},
+  "council_scores": {
+    "information_quality": 55,
+    "trade_clarity": 40,
+    "evidence_strength": 67,                  // % claims not “insufficient”
+    "why": "evidence_strength=67% (...); information_quality=55; trade_clarity=40; penalties(...)"
+  },
+  "rationale": ["Bull: ...", "Bear: ...", "Liquidity: spread ≈ 1.3%"],
+  "blocking_issues": ["Illiquidity / wide spread"],
+  "citations": [],
+  "audit": {
+    "post_bullets": ["..."],
+    "claims": [{"id":"c1","text":"...","verdict":"supported","why":"..."}],
+    "context_used": ["..."],
+    "timestamps": {"ingested_utc":"...","researched_utc":"..."},
+    "why":"Weighted Local Research > Post > Context; liquidity (if any) penalized."
+  },
+  "action": "paper_trade",                    // no_trade | monitor | paper_trade | consider_small_size
+  "next_checks": [
+    "Locate dated catalysts (filings/news).",
+    "Check volume and spread trend.",
+    "Validate key claims via reliable sources."
+  ],
+  "why": "direction=up; timeframe=swing_days; evidence_strength=67%; spread≈1.3%; bull='...'; bear='...'"
+}
+
+
+Key fields to consume downstream
+
+asset.ticker / asset.market
+
+direction (up/down/none) & timeframe
+
+confidence (0..1) — start small; rescale with live PnL later
+
+council_scores.evidence_strength (0..100)
+
+liquidity_risk.spread_pct (None if unknown; penalize wide spreads)
+
+action (basic routing suggestion)
+
+4) Installation & Running
+Requirements
+
+Python 3.11+
+
+pip install -r requirements.txt (typical: pydantic>=2, pandas, requests)
+
+Ollama running locally with your chosen model pulled (e.g., mistral)
+
+Quick start (CLI)
+# analyze a random row from CSV (defaults to ./raw_posts_log.csv)
+python round_table.py --dummytest --random --model mistral --pretty --verbose
+
+# analyze the latest row
+python round_table.py --dummytest --latest --model mistral --pretty
+
+# with custom CSV path and dump artifacts
+python round_table.py --dummytest /path/to/raw_posts_log.csv --latest --dump-dir ./.rt_dumps
+
+## round_table.py architecture in practice
+
+The script is both a CLI entry-point and the orchestration layer that the backend
+uses to run council stages.
+
+* **`RoundTable` class** – wraps an Ollama-backed `LLMClient`, performs schema
+  repair/retries, tracks autofix metrics, and exposes helper methods such as
+  `run_entity`, `run_summariser`, and `run_direction`. These methods simply
+  delegate to the stage functions inside `council/`, but they ensure consistent
+  tracing/dumping behaviour and retry policies before a payload is validated by
+  Pydantic.【F:round_table.py†L594-L702】【F:round_table.py†L702-L748】
+* **`fuse_moderator`** – takes the validated stage outputs and produces a
+  `TradeSignal`, normalising liquidity notes, rationale bullets, citations, and
+  penalties for missing `why` fields. This is what downstream automation
+  consumes.【F:round_table.py†L748-L923】
+* **`run_stages_for_post`** – updates/loads the SQLite-backed corpus, prepares
+  evidence frames, executes any requested council stages (re-using cached
+  results when allowed), and writes each payload back into the `stages` table so
+  later runs can be resumed. The function emits human-friendly logging and is
+  the function the backend server calls directly (no `interface_round_table.py`
+  shim is needed after the refactor).【F:round_table.py†L1765-L2119】
+* **CLI modes** – the bottom of the file keeps the legacy `stage` runner and the
+  CSV-driven dummy test harness. Both modes route through the same functions
+  listed above so that manual testing exercises the identical code-paths that
+  the API uses.【F:round_table.py†L2119-L2260】
+
+## Council stage modules (`council/`)
+
+Every stage script contains two responsibilities: a system/user prompt pair for
+its Ollama role and a normaliser that repairs the raw JSON before it is
+validated. They all depend on shared models/helpers from `council/common.py`.
+
+* **`common.py`** – defines the Pydantic models returned by each stage, literal
+  enums for shared fields, ticker metadata helpers, text pre-cleaning, and the
+  `GLOBAL_RULE` prompt fragment that enforces the `why` fields across the
+  council.【F:council/common.py†L1-L237】【F:council/common.py†L400-L520】
+* **`entity_stage.py`** – identifies tradable tickers/markets, coerces sloppy
+  ticker formats, filters out non-equities, and maps informal timeframe words
+  into the canonical enum. The exported `run_entity` function is what
+  `RoundTable.run_entity` calls.【F:council/entity_stage.py†L1-L83】【F:council/entity_stage.py†L103-L132】
+* **`summariser_stage.py`** – produces factual bullets, metadata about assets,
+  numbers, catalysts, and stance, and runs a follow-up spam likelihood
+  classification using heuristics plus the earlier summary output. Normalisers
+  expand magnitudes (e.g., `5M`→`5000000`) and enrich tickers with exchange
+  metadata.【F:council/summariser_stage.py†L1-L160】【F:council/summariser_stage.py†L160-L220】
+* **`claims_stage.py`** – extracts concrete, checkable claims, assigns stable
+  ids/types, and enforces the mandatory `why` rationale per claim. It produces a
+  `ClaimsOut` container consumed by the verifier.【F:council/claims_stage.py†L1-L63】【F:council/claims_stage.py†L70-L97】
+* **`verifier_stage.py`** – maps each claim to evidence bundles, normalises
+  verdicts/citations, and provides a strict fallback when the model fails. It is
+  responsible for grounding the pipeline in local CSV or SQLite evidence.【F:council/verifier_stage.py†L1-L160】【F:council/verifier_stage.py†L160-L232】
+* **`context_stage.py`** – supplies neutral historical background, benchmarks,
+  and a stale-risk flag for the asset mentioned in the post, ensuring strings
+  are coerced into lists and `stale_risk_level` is clamped to `0–3`.【F:council/context_stage.py†L1-L65】【F:council/context_stage.py†L65-L93】
+* **`bull_case_stage.py`** – the “FOR” analyst. Scores setup quality across
+  specificity/timeliness/edge, lists bullish catalysts, and hints at what would
+  improve conviction.【F:council/bull_case_stage.py†L1-L63】【F:council/bull_case_stage.py†L63-L92】
+* **`bear_case_stage.py`** – the “AGAINST” analyst. Highlights red flags, data
+  gaps, and sanity-checks liquidity mentions before flagging them as real trade
+  blockers.【F:council/bear_case_stage.py†L1-L68】【F:council/bear_case_stage.py†L68-L107】
+* **`direction_stage.py`** – reconciles the preceding outputs into an implied
+  direction, timeframe, strength score, and tradability guidance. Any missing or
+  out-of-range values are normalised to safe defaults.【F:council/direction_stage.py†L1-L63】【F:council/direction_stage.py†L63-L103】
+* **`init_db.py` & SQL files** – bootstrap the `wisdom_of_sheep.sql` SQLite
+  database from `council_schema.sql`, giving the pipeline somewhere to persist
+  stage payloads and audit history. Run this once during setup when you need a
+  fresh database.【F:council/init_db.py†L1-L17】
+
+Together these modules replace the older `interface_round_table.py` entry point;
+all tooling should import `round_table.py` directly (for example, the backend
+server calls `round_table.run_stages_for_post`).
+
+
+Flags of note
+
+--evidence-lookback-days 120 – how far back the verifier searches
+
+--max-evidence-per-claim 3 – cap citations per claim
+
+--host http://localhost:11434 – Ollama base URL
+
+--dump-dir ./dumps – stores raw/normalized/retry JSON for debugging
+
+5) Using the signal for auto-trading
+
+Below is a conservative mapping you can start with. Adjust to your broker/risk model.
+
+Eligibility filter
+
+Require asset.ticker present.
+
+Reject if direction == "uncertain" or timeframe == "uncertain".
+
+Reject if liquidity_risk.spread_pct >= 0.05 (≥ 5%) unless specifically trading illiquid.
+
+Optionally require council_scores.evidence_strength ≥ 40.
+
+Side & product
+
+direction == "up" → long
+
+direction == "down" → short (or inverse ETF / options strategy)
+
+direction == "none" → skip or range strategy only if you support it
+
+Sizing (toy rule)
+
+Base size = S_base * confidence
+
+Downscale by spread: size *= clamp(1 - 8*spread_pct, 0.2, 1.0) if spread_pct known
+
+Cap by risk budget per symbol/day
+
+Entry/exit heuristics
+
+Map timeframe to a max holding window:
+
+intraday → close by end of day
+
+swing_days → ≤ 5 sessions
+
+swing_weeks → ≤ 20 sessions
+
+multi_months/long_term → your portfolio rules
+
+Stops: ATR-based or fixed %; widen for illiquid names
+
+Take-profit: symmetric to stop or trailing
+
+Duplication control
+
+Use signal_id to avoid acting twice on the same source text.
+
+6) Backtesting the signals
+
+You can log each TradeSignal to a JSON Lines file and replay them against historical prices.
+
+A. Persist signals
+
+Save TradeSignal objects as they’re produced (one per source post analyzed).
+
+Minimal fields needed for replay:
+
+timestamps.ingested_utc (from audit)
+
+asset.ticker, direction, timeframe, confidence, liquidity_risk.spread_pct, council_scores.evidence_strength, action, signal_id.
+
+B. Reconstruct trades
+
+For each signal date/time, fetch OHLCV for ticker from your data source.
+
+Apply your entry rule (e.g., next open) and exit rule (per timeframe window/stop/TP).
+
+Include slippage ≈ max(0.5 * spread_pct, 1 tick) if you have spread; else use a default.
+
+Optionally reject signals with spread_pct >= 5% in the backtest to approximate liquidity filters.
+
+C. Examples (pseudo)
+
+Entry: next session open (or next 5-min bar if intraday)
+
+Exit: after N bars per timeframe, or stop/TP first
+
+Weight: proportional to confidence (clip to [0.1, 0.5])
+
+D. Metrics to track
+
+Win rate, PF, Sharpe, max DD
+
+Performance by timeframe, evidence_strength deciles, spread buckets
+
+Leakage checks: ensure you don’t use any data after ingested_utc
+
+7) Troubleshooting
+
+“Validation error / invalid JSON”
+Use --dump-dir and inspect *_raw.json vs *_normalized.json. The repair layer (_normalize_*) is robust, and there’s a single strict retry built in.
+
+Empty/weak verifier
+Ensure your CSV has recent, relevant items and that lookback-days isn’t too small. The verifier degrades to insufficient verdicts when it can’t find good citations.
+
+Over-confident behavior
+Tighten your execution rules: require higher evidence_strength, reduce position size scale by confidence, or enforce stricter spread filters.
+
+8) Design notes (trust & guardrails)
+
+Every role includes a mandatory why field (1–3 sentences). Missing whys trigger penalties.
+
+Verifier must cite sources; missing citations are penalized.
+
+Liquidity awareness via spread: if the post contains bid/ask, spread is computed and used for action/sizing/penalties.
+
+Council scores are post-penalty and their why reflects the final numbers.
+
+9) Programmatic usage (import)
+from round_table import analyze_post, SourceRef
+import pandas as pd
+
+df = pd.read_csv("raw_posts_log.csv")
+post = "NVDA earnings beat; guidance strong; AI demand still accelerating."
+signal, signal_dict = analyze_post(
+    post_text=post,
+    model="mistral",
+    host="http://localhost:11434",
+    evidence_df=df,
+    evidence_lookback_days=120,
+    max_evidence_per_claim=3,
+    source=SourceRef(type="reddit", post_id=None, url=None),
+    verbose=False,
+    dump_dir=None,
+)
+print(signal_dict["asset"]["ticker"], signal_dict["direction"], signal_dict["confidence"])
+
+10) License & Attribution
+
+Local LLM inference via Ollama; ensure you comply with the model’s license.
+
+This project is for research/educational purposes; no warranty. Use at your own risk.
+
+Appendix: Field cheat-sheet (for bots/backtests)
+
+Go/No-Go: direction ∈ {up,down} AND timeframe != uncertain
+
+Quality: council_scores.evidence_strength (0–100)
+
+Liquidity: liquidity_risk.spread_pct (prefer < 2%)
+
+Risk gate: reject spread_pct≥0.05 or very low evidence strength
+
+Sizing: base × confidence; downscale by spread

@@ -1,0 +1,330 @@
+Wisdom of Sheep — Round Table Pipeline: Recent Changes & Strategy Roadmap
+
+Last updated: today
+
+This document summarizes the latest fixes to round_table.py, why they matter, and sketches the strategy layer we’ll build on top of the derived signal data. It also outlines how we’ll scale to the full scraped corpus and backtest end-to-end.
+
+What changed (and why it’s better)
+1) Robust Ticker Metadata & Hallucination Guard
+
+What we added: a lightweight CSV-backed ticker lookup with lazy load (WOS_TICKERS_CSV env or tickers.csv).
+
+How it’s used:
+
+Entity normalization: assets are enriched with exchange/market where known.
+
+Summariser assets_mentioned: when CSV metadata exists, we override the LLM’s guessed name; when it doesn’t, we prefer the ticker string over a hallucinated company name.
+
+Why it matters: avoids “Radeon Technologies (AMD)” type errors for ambiguous short symbols (e.g., RR) and improves downstream mapping to tradable instruments.
+
+2) Date Sanity Check (No Back-dated Hallucinations)
+
+What we added: parsing of slash dates, month names, and bare years from the source post text.
+
+Policy: the pipeline should never infer a date not present in the text; verifier/context avoid re-interpreting undated month/day references.
+
+Why it matters: prevents misreads like “Oct 27, 2021” when the post never contained that year.
+
+3) Magnitude Expansion Everywhere
+
+What we fixed: _expand_magnitude now expands the first in-phrase shorthand (e.g., “more than 2M” → “more than 2000000”) before numeric coercion.
+
+Why it matters: the numeric normalizer no longer collapses “2M” to “2” in qualitative phrases; numbers now flow correctly to analytics/metrics.
+
+4) Contracts Unit Normalization
+
+What we fixed: any number mention with a label containing “contract” is set to unit="contracts", even when the model said "units" or "$".
+
+Why it matters: consistent measurements (contracts vs. units) enable clean aggregation and spread calculations.
+
+5) Deduplicated Options Tuples
+
+What we added: option tuples parsed from free text are deduped by (expiry, strike, type).
+
+Why it matters: better audit trail; avoids inflating “options_seen” in the moderator signal.
+
+6) Market Normalization ("NULL" → None)
+
+What we fixed: _norm_exchange now maps "NULL"/"N/A"/"UNKNOWN" to None.
+
+Why it matters: cleaner JSON, fewer noisy strings that look like valid exchanges.
+
+7) Evidence Builder Quality & Verifier Fallback
+
+What we kept/tuned: evidence builder remains conservative (time-filtered, alias-aware, dedup by URL).
+
+Fallbacks: if the verifier fails JSON, we set all verdicts to insufficient with a clear “Auto-fallback” tag and do not inflate evidence strength.
+
+Why it matters: prevents false confidence; downstream strategy can rely on a calibrated evidence_strength.
+
+8) Penalty & Metrics Clarity
+
+What we refined: penalties are only applied for truly schema-relevant issues (top-level “why” autofixes; missing whys inside arrays like claims[] and verdicts[]).
+
+Why it matters: council scores reflect content quality, not harmless formatting drift.
+
+Current CLI usage
+
+One-off dummy run (recommended while we harden):
+
+python round_table.py \
+  --dummytest raw_posts_log.csv \
+  --post-id t3_XXXXXXX \
+  --model mistral \
+  --pretty --verbose --no-timeout
+
+
+Environment:
+
+WOS_TICKERS_CSV=/path/to/tickers.csv (optional; defaults to ./tickers.csv)
+
+Notes:
+
+--dummytest picks from the CSV you specify.
+
+--post-id targets a specific row by id to reproduce bugs/regressions.
+
+--dump-dir will emit raw/normalized JSON per role for diffs.
+
+What the signal looks like (high level)
+
+Each run yields a TradeSignal:
+
+asset (ticker, market?), direction, timeframe, confidence
+
+council_scores (information_quality, trade_clarity, evidence_strength)
+
+rationale (bull/bear distilled), blocking_issues (e.g., “No verified catalysts”)
+
+liquidity_risk (estimated bid/ask spread if parsed)
+
+audit (bullets, claims with verdicts, context used, options seen)
+
+This is the information side of the system. The price/market side will be our indicators, MAs, and execution logic.
+
+Strategy Layer — Design Discussion
+
+We’ll build a Strategy Orchestrator that consumes TradeSignals and emits scheduled trading actions. The actions can be short-term (intraday/swing) or longer horizon (multi-months/long-term), and they will be backed by technical confirmation and risk controls.
+
+A. From Signals to Actions (Decision Bridge)
+
+Input: TradeSignal
+Output: PlannedAction[] (timestamped orders/alerts)
+
+Core mapping (examples):
+
+If direction="up", timeframe="swing_weeks", evidence_strength ≥ 30%, and council information_quality ≥ 50 → consider long with confirmation.
+
+If evidence_strength=0% but clarity is high (clean bull thesis, low spread) → paper trade or monitor with tight confirmation rules.
+
+If blocking_issues contains “No clear tradable US ticker” or “Illiquidity / wide spread” → no trade.
+
+Each action has:
+
+side: buy/sell
+
+instrument: resolved from asset + exchange mapping
+
+entry rules: confirmation signals (e.g., MA crossover, RSI recovery, breakout above X)
+
+risk: initial stop, position sizing, max adverse move
+
+time budget: aligned with timeframe (exit if thesis expires)
+
+B. Technical Confirmation Layer (Price/Market Side)
+
+We’ll combine the information signal with algorithmic measurements:
+
+Moving Averages: SMA/EMA(20/50/200) for trend & pullbacks
+
+Volatility: ATR for stop placement and position sizing
+
+Momentum/Oscillators: RSI/MACD for confirmation
+
+Breakouts: high-volume range breaks; session highs/lows
+
+Spread/Liquidity checks: avoid names with wide spreads (e.g., ≥5%) or flag them as “monitor only”
+
+Example confirmation rule:
+
+Signal is bullish (swing_weeks) → wait until:
+
+Price closes above EMA(20) AND
+
+RSI(14) > 50 AND
+
+Volume > 1.5 × 20-day average
+
+Then place entry next session at market-on-open with ATR-based stop.
+
+C. Scheduled Trading Actions (Planner)
+
+We’ll create a daily job that:
+
+Pulls new TradeSignals since last run.
+
+Joins with market data (OHLCV) for the symbols.
+
+Evaluates confirmation rules.
+
+Emits a set of Scheduled Actions (JSON line items) with:
+
+id, symbol, intended_time, side, entry_kind (market/limit/stop), entry_params, risk_params, notes
+
+Stores them in a persistent collection (e.g., planned_actions.jsonl or DB).
+
+This schedule becomes the canonical plan; we can later plug execution/broker APIs, but for now it’s the scaffold for backtests and review.
+
+D. Backtesting Plan
+
+Corpus: your continuously growing scraped news/Reddit log.
+
+Market data: OHLCV at appropriate resolutions (e.g., daily for swing, minute for intraday if we go there later).
+
+Replay loop:
+
+Process posts in chronological order, run round_table.py, produce signals.
+
+On each market day, apply the Planner to generate actions based on signals known up to that time only (no peeking).
+
+Simulate fills and PnL using historical OHLCV and a simple slippage model.
+
+Track metrics: hit rate, avg win/loss, expectancy, max drawdown, exposure, Sharpe, and “alpha-decay” vs. signal age.
+
+Key guards for realism:
+
+Timestamp discipline: signal generation time < trade time.
+
+Data availability lag: assume some delay between post time and strategy digest (e.g., next bar).
+
+Liquidity controls: skip trades when ADV is too low or spread > threshold.
+
+E. Signal Strength & Confidence Blending
+
+We’ll treat confidence and evidence_strength as modifiers, not absolutes:
+
+Position sizing: scale base size by confidence (cap/tiers).
+
+Hold time: longer for higher evidence; shorter for zero-evidence monitor trades.
+
+Stop/take profit: ATR multiples widened slightly with stronger evidence.
+
+F. Risk & Governance
+
+Global guardrails: max positions, sector concentration, overnight exposure limits.
+
+Kill-switch: if daily loss > X% or MDD > Y% in backtest/live, stop new entries.
+
+Action decay: if a signal is older than its timeframe window and never confirmed, auto-cancel the planned action.
+
+Scaling to the Full Corpus
+
+Running round_table.py across the entire scrape will take days, so we’ll:
+
+Continue dummy testing on selected posts to harden normalization and evidence routines.
+
+Add batch tooling:
+
+Chunked processing with resume checkpoints.
+
+On-disk caches of normalized outputs (per post id).
+
+Periodic metrics dump (error rates, average runtime, evidence hit rates).
+
+Quality dashboards:
+
+Counts of insufficient verdicts vs supported/refuted.
+
+Ticker coverage vs CSV metadata coverage.
+
+Top recurring blocking issues (e.g., “No verified catalysts”).
+
+Failure policy: Any role that fails JSON → retry once with corrected prompts; if still bad, use conservative fallback (insufficient), tag the run, and continue. We prefer complete coverage with conservative defaults over aborting the batch.
+
+Open Questions (for near-term design)
+
+Ambiguous short tickers: When should we require ≥2 cashtag hits or CSV confirmation before promoting a 1–2 letter ticker to primary?
+
+Multi-asset posts: If multiple tickers tie on salience, should we create a basket monitor action automatically?
+
+Evidence weighting: Do we down-weight Reddit citations vs. RSS/filings in evidence_strength, or just require at least one non-self citation for >0%?
+
+Intraday path: Do we implement an intraday branch now (minute data, micro-structure filters) or keep first release to daily swing?
+
+Implementation Notes / Snippets
+Env / Config
+export WOS_TICKERS_CSV=/path/to/tickers.csv
+
+Planner Interface (pseudocode)
+@dataclass
+class PlannedAction:
+    id: str
+    symbol: str
+    side: Literal["buy","sell"]
+    timeframe: str
+    entry_kind: Literal["market_open","limit","stop"]
+    entry_params: dict
+    risk: dict  # {stop: price|ATRx, take_profit: price|RR, size: shares}
+    intended_time: datetime
+    notes: list[str]
+
+def plan_from_signal(signal: TradeSignal, ohlcv: pd.DataFrame) -> list[PlannedAction]:
+    if "No clear tradable US ticker" in signal.blocking_issues:
+        return []
+    if signal.action in ("no_trade",):
+        return []
+    # Example bullish swing rule:
+    if signal.direction == "up" and signal.timeframe in ("swing_days","swing_weeks"):
+        if confirm_with_ma_rsi_volume(ohlcv):
+            return [build_action_long_swing(signal)]
+        else:
+            return [build_monitor_alert(signal)]
+    return []
+
+Backtest Skeleton (pseudocode)
+for day in trading_days:
+    # 1) ingest posts up to 'day T-1', run round_table -> signals
+    signals = load_or_generate_signals(up_to=day - 1d)
+    # 2) plan actions using ohlcv up to 'day T-1'
+    planned = plan_all(signals, ohlcv_history_to(day - 1d))
+    # 3) execute actions on 'day T' open/limits, simulate fills, update PnL
+    fills = simulate_fills(planned, ohlcv_day=day)
+    portfolio.update(fills)
+
+Next Steps
+
+Land the tiny patches:
+
+In-phrase magnitude expansion
+
+Contracts unit override
+
+Prefer ticker name when no CSV match
+
+"NULL" → None in _norm_exchange
+
+Add a “planner” module that:
+
+Consumes TradeSignal
+
+Applies configurable confirmation rules (YAML/JSON)
+
+Emits PlannedActions (JSONL) with minimal metadata for backtest
+
+Backtest harness:
+
+Chronological replay
+
+Simple slippage model
+
+Metric reporting
+
+Batch runner for the full scrape:
+
+Resume checkpoints
+
+Output caches per post id
+
+Error/quality dashboard
+
+Keep dummy testing until evidence strength and asset mapping look stable across a variety of noisy posts.
