@@ -30,11 +30,14 @@ TICKER_STOP = {
 }
 CONF_MAP = {"low": 0.3, "medium": 0.6, "high": 0.9}
 
-TICKER_CACHE_PATH = Path("tickers_all.csv")
+PROTOTYPE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = PROTOTYPE_DIR.parent
+
+TICKER_CACHE_PATH = REPO_ROOT / "tickers" / "tickers_all.csv"
 TICKER_CACHE_MAX_AGE = timedelta(days=7)
 
 # --- Trade log (append-only events) ---
-TRADES_CSV = Path("trades_log.csv")
+TRADES_CSV = PROTOTYPE_DIR / "trades_log.csv"
 # event_type ∈ {"PLACED","CLOSE"}
 TRADE_LOG_COLUMNS = [
     "event_type","trade_id","post_id","ticker","direction",
@@ -45,7 +48,7 @@ TRADE_LOG_COLUMNS = [
 ]
 
 # --- Raw post archive (append-only) ---
-RAW_POSTS_CSV = Path("raw_posts_log.csv")
+RAW_POSTS_CSV = REPO_ROOT / "raw_posts_log.csv"
 RAW_POST_COLUMNS = [
     "scraped_at",
     "platform",
