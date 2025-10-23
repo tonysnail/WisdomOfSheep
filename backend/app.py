@@ -24,15 +24,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Callable, Literal
 
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from fastapi.encoders import jsonable_encoder
 
+from backend.council_time import CouncilTimeModel, approximate_token_count
 
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 # round_table.py pulls in heavy optional dependencies (pandas, etc.). During
 # unit tests we don't need the real implementation, so we tolerate import
@@ -70,6 +73,7 @@ except Exception as exc:  # noqa: BLE001
 # Config (env-overridable)
 # =========================
 DB_PATH = ROOT / "council" / "wisdom_of_sheep.sql"
+TIME_MODEL_PATH = ROOT / "council" / "council_time_model.json"
 CSV_PATH = ROOT / "raw_posts_log.csv"
 TICKERS_DIR = ROOT / "tickers"  # <- your new folder
 
@@ -122,6 +126,8 @@ CONVO_MODEL = os.getenv("WOS_CONVO_MODEL", ROUND_TABLE_MODEL)
 CONVO_HUB_LOCK = threading.Lock()
 CONVO_HUB_INSTANCE: Optional["ConversationHub"] = None
 _TICKER_UNIVERSE: Optional[Set[str]] = None
+
+COUNCIL_TIME_MODEL = CouncilTimeModel(TIME_MODEL_PATH)
 
 
 # ───────────────────────── Technical / Sentiment tool palettes ─────────────────────────
@@ -297,6 +303,20 @@ def _ensure_schema(conn: sqlite3.Connection):
       post_id      TEXT PRIMARY KEY,
       payload_json TEXT NOT NULL
     )""")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS council_analysis_errors (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      post_id      TEXT NOT NULL,
+      stage        TEXT,
+      stage_label  TEXT,
+      message      TEXT,
+      log_excerpt  TEXT,
+      job_id       TEXT,
+      occurred_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    )""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_council_analysis_errors_post ON council_analysis_errors(post_id)"
+    )
     conn.execute("""
     CREATE TABLE IF NOT EXISTS council_stage_interest (
       post_id             TEXT PRIMARY KEY,
@@ -988,6 +1008,76 @@ def _insert_stage_payload(
     )
     conn.commit()
     return created_at
+
+
+def _extract_summary_text(payload: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    parts: List[str] = []
+    summary_text = payload.get("summary_text")
+    if isinstance(summary_text, str):
+        text = summary_text.strip()
+        if text:
+            parts.append(text)
+    bullets = payload.get("summary_bullets")
+    if isinstance(bullets, list):
+        for bullet in bullets:
+            text_val: Optional[str] = None
+            if isinstance(bullet, str):
+                text_val = bullet
+            elif isinstance(bullet, dict):
+                raw = bullet.get("text") or bullet.get("summary")
+                if isinstance(raw, str):
+                    text_val = raw
+            if not text_val:
+                continue
+            text = text_val.strip()
+            if text:
+                parts.append(text)
+    if not parts:
+        return ""
+    return "\n".join(parts)
+
+
+def _article_summary_tokens(post_id: str) -> Tuple[int, int]:
+    with _connect() as conn:
+        _ensure_schema(conn)
+        row = _q_one(conn, "SELECT text FROM posts WHERE post_id = ?", (post_id,))
+        article_text = ""
+        if row and row.get("text"):
+            article_text = str(row["text"] or "")
+        summary_payload = _latest_stage_payload(conn, post_id, "summariser") or {}
+    summary_text = _extract_summary_text(summary_payload)
+    return approximate_token_count(article_text), approximate_token_count(summary_text)
+
+
+def _record_council_error(
+    post_id: str,
+    stage: str,
+    stage_label: str,
+    message: str,
+    job_id: str,
+    *,
+    log_excerpt: Optional[str] = None,
+) -> None:
+    trimmed_message = (message or "").strip()
+    trimmed_excerpt = (log_excerpt or "").strip()
+    if trimmed_excerpt and len(trimmed_excerpt) > 8000:
+        trimmed_excerpt = trimmed_excerpt[:8000]
+    try:
+        with _connect() as conn:
+            _ensure_schema(conn)
+            conn.execute(
+                """
+                INSERT INTO council_analysis_errors
+                  (post_id, stage, stage_label, message, log_excerpt, job_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (post_id, stage, stage_label, trimmed_message or None, trimmed_excerpt or None, job_id),
+            )
+            conn.commit()
+    except Exception:  # noqa: BLE001
+        logging.exception("failed to record council error for %s stage %s", post_id, stage)
 
 
 def _now_iso() -> str:
@@ -2047,6 +2137,11 @@ def _worker_council_analysis(job_id: str) -> None:
                 current="",
                 ended_at=time.time(),
                 remaining=max(int(current.get("remaining") or 0), 0),
+                current_mode=None,
+                current_eta_seconds=None,
+                current_started_at=None,
+                current_article_tokens=None,
+                current_summary_tokens=None,
             )
             return False
         return True
@@ -2059,29 +2154,72 @@ def _worker_council_analysis(job_id: str) -> None:
             post_id = str(entry.get("post_id") or "")
             title = str(entry.get("title") or "")
             score = entry.get("interest_score")
+            mode = str(entry.get("mode") or "interest")
             score_txt = ""
             if isinstance(score, (int, float)):
                 score_txt = f" {int(round(float(score)))}%"
 
             display_title = title[:120]
             remaining = max(total - index, 0)
+
+            article_tokens = 0
+            summary_tokens = 0
+            try:
+                article_tokens, summary_tokens = _article_summary_tokens(post_id)
+            except Exception:  # noqa: BLE001
+                logging.exception("failed to compute token counts for %s", post_id)
+
+            eta_seconds: Optional[float] = None
+            try:
+                eta_seconds = COUNCIL_TIME_MODEL.predict(article_tokens, summary_tokens)
+            except Exception:  # noqa: BLE001
+                eta_seconds = None
+
+            article_started_at = time.time()
             _job_update_fields(
                 job_id,
                 current=f"{post_id} — {display_title}",
                 remaining=remaining,
+                current_mode=mode,
+                current_started_at=article_started_at,
+                current_eta_seconds=eta_seconds,
+                current_article_tokens=article_tokens,
+                current_summary_tokens=summary_tokens,
             )
 
-            _job_append_log(job_id, f"→ analysing {post_id}{score_txt} {display_title}".rstrip())
+            prefix = "→ analysing"
+            if mode == "repair":
+                prefix = "→ repairing"
+            _job_append_log(job_id, f"{prefix} {post_id}{score_txt} {display_title}".rstrip())
 
             try:
                 clear_post_analysis(post_id)
             except HTTPException as exc:
                 detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+                _record_council_error(post_id, "clear_analysis", "Clear Council Analysis", detail, job_id)
                 _job_append_log(job_id, f"✗ clear failed {post_id}: {detail}")
+                _job_update_fields(
+                    job_id,
+                    current_eta_seconds=None,
+                    current_started_at=None,
+                    current_article_tokens=None,
+                    current_summary_tokens=None,
+                    current_mode=None,
+                )
                 _job_increment(job_id, "done", 1)
                 continue
             except Exception as exc:  # noqa: BLE001
-                _job_append_log(job_id, f"✗ clear failed {post_id}: {exc}")
+                message = str(exc)
+                _record_council_error(post_id, "clear_analysis", "Clear Council Analysis", message, job_id)
+                _job_append_log(job_id, f"✗ clear failed {post_id}: {message}")
+                _job_update_fields(
+                    job_id,
+                    current_eta_seconds=None,
+                    current_started_at=None,
+                    current_article_tokens=None,
+                    current_summary_tokens=None,
+                    current_mode=None,
+                )
                 _job_increment(job_id, "done", 1)
                 continue
 
@@ -2091,33 +2229,73 @@ def _worker_council_analysis(job_id: str) -> None:
                     return
                 label = _council_stage_label(stage)
                 _job_append_log(job_id, f"→ {label} for {post_id}")
+                err_output = ""
                 try:
                     if stage == "research":
                         _run_research_pipeline(post_id)
                     else:
                         code, _out, err = _run_round_table(post_id, [stage], False, False)
                         if code != 0:
+                            err_output = err or ""
                             raise RuntimeError(err or f"{stage} failed")
                 except HTTPException as exc:
                     detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+                    _record_council_error(post_id, stage, label, detail, job_id, log_excerpt=err_output)
                     _job_append_log(job_id, f"✗ {label} failed {post_id}: {detail}")
                     stage_ok = False
                     break
                 except Exception as exc:  # noqa: BLE001
-                    _job_append_log(job_id, f"✗ {label} failed {post_id}: {exc}")
+                    message = str(exc) or repr(exc)
+                    _record_council_error(post_id, stage, label, message, job_id, log_excerpt=err_output)
+                    _job_append_log(job_id, f"✗ {label} failed {post_id}: {message}")
                     stage_ok = False
                     break
 
             if stage_ok:
                 _job_append_log(job_id, f"✓ council analysis completed {post_id}")
+                try:
+                    duration = time.time() - article_started_at
+                    COUNCIL_TIME_MODEL.observe(article_tokens, summary_tokens, duration)
+                except Exception:  # noqa: BLE001
+                    logging.exception("failed to record duration for %s", post_id)
 
             _job_increment(job_id, "done", 1)
+            if mode == "repair":
+                _job_increment(job_id, "repairs_done", 1)
             remaining_after = max(total - (index + 1), 0)
-            _job_update_fields(job_id, remaining=remaining_after)
+            _job_update_fields(
+                job_id,
+                remaining=remaining_after,
+                current_eta_seconds=None,
+                current_started_at=None,
+                current_article_tokens=None,
+                current_summary_tokens=None,
+            )
 
-        _job_update_fields(job_id, status="done", ended_at=time.time(), current="", remaining=0)
+        _job_update_fields(
+            job_id,
+            status="done",
+            ended_at=time.time(),
+            current="",
+            remaining=0,
+            current_mode=None,
+            current_eta_seconds=None,
+            current_started_at=None,
+            current_article_tokens=None,
+            current_summary_tokens=None,
+        )
     except Exception as exc:  # noqa: BLE001
-        _job_update_fields(job_id, status="error", error=str(exc), ended_at=time.time())
+        _job_update_fields(
+            job_id,
+            status="error",
+            error=str(exc),
+            ended_at=time.time(),
+            current_mode=None,
+            current_eta_seconds=None,
+            current_started_at=None,
+            current_article_tokens=None,
+            current_summary_tokens=None,
+        )
     finally:
         _job_update_fields(job_id, queue=[])
         with COUNCIL_JOB_LOCK:
@@ -2127,6 +2305,7 @@ def _worker_council_analysis(job_id: str) -> None:
 
 class CouncilAnalysisStartRequest(BaseModel):
     interest_min: float = Field(0.0, ge=0.0, le=100.0)
+    repair_missing: bool = False
 
 
 @app.post("/api/council-analysis/start")
@@ -2147,7 +2326,51 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
         job_id = str(uuid.uuid4())
         ACTIVE_COUNCIL_JOB_ID = job_id
 
+    repair_queue: List[Dict[str, Any]] = []
+    repair_ids: Set[str] = set()
+
     with _connect() as conn:
+        _ensure_schema(conn)
+        if payload.repair_missing:
+            repair_rows = _q_all(
+                conn,
+                """
+                SELECT
+                  p.post_id,
+                  COALESCE(p.title, '') AS title,
+                  COALESCE(ci.interest_score, 0) AS interest_score,
+                  COALESCE(p.posted_at, p.scraped_at, '') AS article_time
+                FROM posts p
+                LEFT JOIN (
+                    SELECT DISTINCT post_id
+                    FROM stages
+                    WHERE stage = 'chairman'
+                ) AS sc ON sc.post_id = p.post_id
+                LEFT JOIN council_stage_interest ci ON ci.post_id = p.post_id
+                WHERE sc.post_id IS NULL
+                ORDER BY datetime(COALESCE(p.posted_at, p.scraped_at)) ASC,
+                         p.post_id ASC
+                """,
+                tuple(),
+            )
+            for row in repair_rows:
+                pid = str(row["post_id"] or "").strip()
+                if not pid:
+                    continue
+                entry: Dict[str, Any] = {
+                    "post_id": pid,
+                    "title": row["title"],
+                    "interest_score": (
+                        float(row["interest_score"])
+                        if row["interest_score"] is not None
+                        else None
+                    ),
+                    "article_time": row["article_time"] or "",
+                    "mode": "repair",
+                }
+                repair_queue.append(entry)
+                repair_ids.add(pid)
+
         rows = _q_all(
             conn,
             """
@@ -2174,23 +2397,30 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
             (threshold,),
         )
 
-    queue: List[Dict[str, Any]] = []
+    interest_queue: List[Dict[str, Any]] = []
     skipped_with_chairman = 0
     for row in rows:
+        pid = str(row["post_id"] or "").strip()
+        if not pid or pid in repair_ids:
+            continue
         if int(row["has_chairman"] or 0):
             skipped_with_chairman += 1
             continue
-        queue.append(
+        interest_queue.append(
             {
-                "post_id": row["post_id"],
+                "post_id": pid,
                 "title": row["title"],
                 "interest_score": float(row["interest_score"] or 0.0),
                 "article_time": row["article_time"] or "",
+                "mode": "interest",
             }
         )
 
+    repair_queue.sort(key=lambda entry: (entry.get("article_time") or "", entry.get("post_id")))
+    interest_queue.sort(key=lambda entry: (entry.get("article_time") or "", entry.get("post_id")))
+    queue: List[Dict[str, Any]] = repair_queue + interest_queue
+
     total = len(queue)
-    queue.sort(key=lambda entry: (entry.get("article_time") or "", entry.get("post_id")))
     now = time.time()
     job_data: Dict[str, Any] = {
         "id": job_id,
@@ -2203,6 +2433,9 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
         "current": "",
         "remaining": total,
         "skipped_with_chairman": skipped_with_chairman,
+        "repairs_total": len(repair_queue),
+        "repairs_done": 0,
+        "repair_missing": bool(payload.repair_missing),
         "log_tail": [],
         "error": "",
         "started_at": None,
@@ -2210,6 +2443,11 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
         "cancelled": False,
         "created_at": now,
         "updated_at": now,
+        "current_mode": None,
+        "current_eta_seconds": None,
+        "current_started_at": None,
+        "current_article_tokens": None,
+        "current_summary_tokens": None,
     }
 
     _job_save(job_data)
@@ -2221,6 +2459,9 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
             else "→ no posts meet the council threshold"
         )
     ]
+    if repair_queue:
+        plural_repair = "s" if len(repair_queue) != 1 else ""
+        summary_bits.append(f"(repairing {len(repair_queue)} missing verdict{plural_repair})")
     if skipped_with_chairman:
         plural = "s" if skipped_with_chairman != 1 else ""
         summary_bits.append(f"(skipped {skipped_with_chairman} post{plural} with chairman verdict)")
@@ -2228,7 +2469,16 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
     _job_append_log(job_id, summary_line)
 
     if total == 0:
-        _job_update_fields(job_id, ended_at=now, remaining=0)
+        _job_update_fields(
+            job_id,
+            ended_at=now,
+            remaining=0,
+            current_mode=None,
+            current_eta_seconds=None,
+            current_started_at=None,
+            current_article_tokens=None,
+            current_summary_tokens=None,
+        )
         with COUNCIL_JOB_LOCK:
             if ACTIVE_COUNCIL_JOB_ID == job_id:
                 ACTIVE_COUNCIL_JOB_ID = None
@@ -2238,6 +2488,7 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
             "total": total,
             "interest_min": threshold,
             "skipped_with_chairman": skipped_with_chairman,
+            "repairs_total": len(repair_queue),
         }
 
     thread = threading.Thread(target=_worker_council_analysis, args=(job_id,), daemon=True)
@@ -2249,6 +2500,7 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
         "total": total,
         "interest_min": threshold,
         "skipped_with_chairman": skipped_with_chairman,
+        "repairs_total": len(repair_queue),
     }
 
 

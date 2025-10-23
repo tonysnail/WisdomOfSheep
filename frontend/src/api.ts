@@ -253,15 +253,35 @@ export type CouncilJob = {
   message?: string
   interest_min?: number
   error?: string
+  repairs_total?: number
+  repairs_done?: number
+  repair_missing?: boolean
+  current_mode?: string | null
+  current_eta_seconds?: number | null
+  current_started_at?: number | null
+  current_article_tokens?: number | null
+  current_summary_tokens?: number | null
 }
 
 export async function startCouncilAnalysis(options: {
   interest_min: number
-}): Promise<{ ok: boolean; job_id: string; total: number; interest_min: number; conflict?: boolean }> {
+  repair_missing?: boolean
+}): Promise<{
+  ok: boolean
+  job_id: string
+  total: number
+  interest_min: number
+  repairs_total: number
+  conflict?: boolean
+}> {
+  const body = {
+    interest_min: options.interest_min,
+    repair_missing: Boolean(options.repair_missing),
+  }
   const res = await fetch(`${API}/api/council-analysis/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ interest_min: options.interest_min }),
+    body: JSON.stringify(body),
   })
   if (res.ok) {
     return json(res)
@@ -272,6 +292,7 @@ export async function startCouncilAnalysis(options: {
       job_id?: string
       total?: number
       interest_min?: number
+      repairs_total?: number
     }
     if (!data.job_id) {
       throw new Error('HTTP 409: Missing job id in response')
@@ -281,6 +302,7 @@ export async function startCouncilAnalysis(options: {
       job_id: data.job_id,
       total: data.total ?? 0,
       interest_min: typeof data.interest_min === 'number' ? data.interest_min : options.interest_min,
+      repairs_total: typeof data.repairs_total === 'number' ? data.repairs_total : 0,
       conflict: true,
     }
   }
