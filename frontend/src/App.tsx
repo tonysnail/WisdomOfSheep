@@ -416,12 +416,10 @@ export default function App() {
       return base
     }
 
-    const utcYear = selectedDate.getUTCFullYear()
-    const utcMonth = selectedDate.getUTCMonth()
-    const utcDay = selectedDate.getUTCDate()
-
-    const start = new Date(Date.UTC(utcYear, utcMonth, utcDay, 0, 0, 0, 0))
-    const end = new Date(Date.UTC(utcYear, utcMonth, utcDay, 23, 59, 59, 999))
+    const start = new Date(selectedDate)
+    start.setHours(0, 0, 0, 0)
+    const end = new Date(selectedDate)
+    end.setHours(23, 59, 59, 999)
 
     return {
       ...base,
@@ -1228,23 +1226,25 @@ export default function App() {
                 </div>
               )}
             </div>
-            <div className="eta-progress-block">
-              <div className="eta-progress-row">
-                <div
-                  className={`progress eta${councilJobActive ? '' : ' inactive'}`}
-                  title={
-                    etaRemainingSeconds != null
-                      ? `~${Math.max(Math.round(etaRemainingSeconds), 0)}s remaining`
-                      : councilJobActive
-                        ? 'Estimating time remaining'
-                        : 'Council analysis idle'
-                  }
-                >
-                  <div style={{ width: `${etaPercent}%` }} />
-                </div>
-                <div className={`muted small eta-text${councilJobActive ? '' : ' inactive'}`}>
-                  Time remaining ~ {etaDisplayText}
-                </div>
+            <div
+              className="eta-progress-block"
+              data-testid="council-eta"
+              title={
+                etaRemainingSeconds != null
+                  ? `~${Math.max(Math.round(etaRemainingSeconds), 0)}s remaining`
+                  : councilJobActive
+                    ? 'Estimating time remaining'
+                    : 'Council analysis idle'
+              }
+            >
+              <div className="eta-progress-label">
+                <span className="muted small">Time remaining</span>
+                <span className={`eta-progress-value${councilJobActive ? '' : ' inactive'}`}>
+                  {etaDisplayText}
+                </span>
+              </div>
+              <div className={`progress eta${councilJobActive ? '' : ' inactive'}`}>
+                <div style={{ width: `${etaPercent}%` }} />
               </div>
             </div>
           </div>
