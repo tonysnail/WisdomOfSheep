@@ -47,6 +47,7 @@ const STORAGE_KEYS = {
   postsPage: 'wos.postsPage',
   interestMin: 'wos.interestMin',
   councilJob: 'wos.councilJobId',
+  councilPrimed: 'wos.councilPrimedMissing',
 } as const
 
 type CouncilProgressState = {
@@ -118,6 +119,10 @@ export default function App() {
   const [councilLogEntry, setCouncilLogEntry] = useState('')
   const [councilLog, setCouncilLog] = useState<string>('')
   const [councilCopyStatus, setCouncilCopyStatus] = useState<'idle' | 'copied' | 'failed'>('idle')
+  const [councilPrimed, setCouncilPrimed] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false
+    return window.localStorage.getItem(STORAGE_KEYS.councilPrimed) === '1'
+  })
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -137,6 +142,15 @@ export default function App() {
     if (typeof window === 'undefined') return
     window.localStorage.setItem(STORAGE_KEYS.interestMin, String(interestFilter))
   }, [interestFilter])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (councilPrimed) {
+      window.localStorage.setItem(STORAGE_KEYS.councilPrimed, '1')
+    } else {
+      window.localStorage.removeItem(STORAGE_KEYS.councilPrimed)
+    }
+  }, [councilPrimed])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -174,6 +188,24 @@ export default function App() {
   const councilJobActive = councilJob
     ? councilJob.status === 'queued' || councilJob.status === 'running' || councilJob.status === 'cancelling'
     : Boolean(councilJobId)
+  const etaBaseSeconds =
+    typeof councilJob?.current_eta_seconds === 'number' && councilJob.current_eta_seconds > 0
+      ? councilJob.current_eta_seconds
+      : null
+  const etaStartedAt =
+    typeof councilJob?.current_started_at === 'number' && councilJob.current_started_at > 0
+      ? councilJob.current_started_at
+      : null
+  const nowSeconds = Date.now() / 1000
+  const hasEtaTiming = etaBaseSeconds != null && etaStartedAt != null
+  const etaElapsedSeconds = hasEtaTiming ? Math.max(nowSeconds - etaStartedAt, 0) : 0
+  const etaRemainingSeconds = hasEtaTiming && etaBaseSeconds != null
+    ? Math.max(etaBaseSeconds - etaElapsedSeconds, 0)
+    : null
+  const etaPercent = hasEtaTiming && etaBaseSeconds != null && etaBaseSeconds > 0
+    ? Math.max(0, Math.min(100, (etaElapsedSeconds / etaBaseSeconds) * 100))
+    : 0
+  const etaDisplayText = councilJobActive ? formatEta(etaRemainingSeconds) : 'idle'
   const councilLastLine = councilLog
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -195,6 +227,36 @@ export default function App() {
     const snippet = chosen.slice(0, 2).join(' · ')
     if (snippet.length <= 200) return snippet
     return `${snippet.slice(0, 197)}…`
+  }
+
+  function formatEta(seconds: number | null): string {
+    if (seconds == null) return 'estimating…'
+    if (!Number.isFinite(seconds)) return 'estimating…'
+    if (seconds <= 0.5) return '<1s'
+    const total = Math.round(seconds)
+    const hours = Math.floor(total / 3600)
+    const minutes = Math.floor((total % 3600) / 60)
+    const secs = total % 60
+    const parts: string[] = []
+    if (hours > 0) {
+      parts.push(`${hours}h`)
+      if (minutes > 0) {
+        parts.push(`${minutes}m`)
+      }
+    } else {
+      if (minutes > 0) {
+        parts.push(`${minutes}m`)
+      }
+      if (minutes < 5 && secs > 0) {
+        parts.push(`${secs}s`)
+      } else if (minutes === 0) {
+        parts.push(`${secs}s`)
+      }
+    }
+    if (parts.length === 0) {
+      parts.push(`${secs}s`)
+    }
+    return parts.join(' ')
   }
 
   const updateLog = (value: string | ((prev: string) => string)) => {
@@ -873,7 +935,11 @@ export default function App() {
 
   async function onStartCouncilProcessing() {
     try {
-      const res = await startCouncilAnalysis({ interest_min: interestFilter })
+      const repairMissing = !councilPrimed
+      const res = await startCouncilAnalysis({
+        interest_min: interestFilter,
+        repair_missing: repairMissing,
+      })
       setCouncilJobId(res.job_id)
       if (!res.conflict) {
         setCouncilLog('')
@@ -886,11 +952,21 @@ export default function App() {
           done: 0,
           remaining: res.total,
           interest_min: res.interest_min,
+          repairs_total: res.repairs_total ?? 0,
+          repairs_done: 0,
           log_tail: [],
           message: '',
           error: undefined,
+          current_eta_seconds: null,
+          current_started_at: null,
+          current_mode: null,
+          current_article_tokens: null,
+          current_summary_tokens: null,
         })
         setCouncilJobBusy(res.total > 0)
+        if (repairMissing && !councilPrimed) {
+          setCouncilPrimed(true)
+        }
       } else {
         setCouncilJobBusy(true)
         setCouncilLogEntry((prev) => prev || 'Council analysis already running.')
@@ -1134,17 +1210,43 @@ export default function App() {
             <span className="toolbar-toggle-label">Council Analysis</span>
           </label>
           <div className="toolbar-progress-group">
-            <div className="progress council" title={councilJobTotal ? `${councilJobDone}/${councilJobTotal}` : undefined}>
-              <div style={{ width: `${councilJobPercent}%` }} />
-            </div>
-            {councilJobTotal > 0 && (
-              <div className="muted small">{councilJobRemaining} remaining</div>
-            )}
-            {councilDisplayLog && (
-              <div className="muted small toolbar-log-snippet" title={councilDisplayLog}>
-                {councilDisplayLog}
+            <div className="council-progress-block">
+              <div
+                className="progress council"
+                title={councilJobTotal ? `${councilJobDone}/${councilJobTotal}` : undefined}
+              >
+                <div style={{ width: `${councilJobPercent}%` }} />
               </div>
-            )}
+              {councilJobTotal > 0 && (
+                <div className="muted small">{councilJobRemaining} remaining</div>
+              )}
+              {councilDisplayLog && (
+                <div className="muted small toolbar-log-snippet" title={councilDisplayLog}>
+                  {councilDisplayLog}
+                </div>
+              )}
+            </div>
+            <div
+              className="eta-progress-block"
+              data-testid="council-eta"
+              title={
+                etaRemainingSeconds != null
+                  ? `~${Math.max(Math.round(etaRemainingSeconds), 0)}s remaining`
+                  : councilJobActive
+                    ? 'Estimating time remaining'
+                    : 'Council analysis idle'
+              }
+            >
+              <div className="eta-progress-label">
+                <span className="muted small">Time remaining</span>
+                <span className={`eta-progress-value${councilJobActive ? '' : ' inactive'}`}>
+                  {etaDisplayText}
+                </span>
+              </div>
+              <div className={`progress eta${councilJobActive ? '' : ' inactive'}`}>
+                <div style={{ width: `${etaPercent}%` }} />
+              </div>
+            </div>
           </div>
           <button
             type="button"
