@@ -13,6 +13,9 @@ const TOTAL_INNER_HEIGHT = PRICE_AREA_HEIGHT + PANEL_GAP + RSI_AREA_HEIGHT + PAN
 const CHART_HEIGHT = TOTAL_INNER_HEIGHT + CHART_PADDING.top + CHART_PADDING.bottom
 const CHART_INNER_WIDTH = CHART_WIDTH - CHART_PADDING.left - CHART_PADDING.right
 const CENTER_RATIO = 2 / 3
+const DAY_MS = 24 * 60 * 60 * 1000
+const FUTURE_WINDOW_DAYS = 30
+const PREVIEW_WINDOW_DAYS = 2
 
 const MOVING_AVERAGE_CONFIG = [
   { period: 20, color: '#f3ac43' },
@@ -392,7 +395,10 @@ export default function PriceWindowChart({
   )
 
   const closes = useMemo(() => chartRows.map((row) => row.close as number), [chartRows])
-  const pointCount = chartPoints.length
+  const chartPointTimes = useMemo(
+    () => chartPoints.map((point) => new Date(point.timestamp).getTime()),
+    [chartPoints],
+  )
 
   const baseOverlayLimitIndex = useMemo(() => {
     if (chartPoints.length === 0) return -1
@@ -409,18 +415,77 @@ export default function PriceWindowChart({
     return idx < 0 ? chartPoints.length - 1 : idx
   }, [chartPoints, effectiveCenterTimestamp])
 
-  const overlayLimitIndex = useMemo(() => {
-    if (chartPoints.length === 0) return -1
-    if (showFutureData) return chartPoints.length - 1
-    return baseOverlayLimitIndex
-  }, [baseOverlayLimitIndex, chartPoints.length, showFutureData])
+  const visibleRange = useMemo(() => {
+    if (chartPoints.length === 0) return { start: 0, end: 0 }
+    if (showFutureData) {
+      if (!effectiveCenterTimestamp) return { start: 0, end: chartPoints.length }
+      const centerMs = new Date(effectiveCenterTimestamp).getTime()
+      if (!Number.isFinite(centerMs)) return { start: 0, end: chartPoints.length }
+      const pastCutoff = centerMs - PREVIEW_WINDOW_DAYS * DAY_MS
+      const futureCutoff = centerMs + FUTURE_WINDOW_DAYS * DAY_MS
 
-  const visibleChartPoints = useMemo(() => {
-    if (showFutureData) return chartPoints
-    if (baseOverlayLimitIndex < 0) return [] as ChartPoint[]
-    const end = Math.min(baseOverlayLimitIndex + 1, chartPoints.length)
-    return chartPoints.slice(0, end)
-  }, [baseOverlayLimitIndex, chartPoints, showFutureData])
+      let startCandidate = chartPointTimes.findIndex((ms) => Number.isFinite(ms) && ms >= pastCutoff)
+      if (startCandidate === -1) {
+        startCandidate = chartPoints.length - 1
+      }
+
+      let startIndex = Math.max(0, startCandidate)
+      if (startCandidate > 0) {
+        const prevMs = chartPointTimes[startCandidate - 1]
+        if (
+          typeof prevMs === 'number' &&
+          Number.isFinite(prevMs) &&
+          centerMs - prevMs <= PREVIEW_WINDOW_DAYS * DAY_MS
+        ) {
+          startIndex = startCandidate - 1
+        }
+      }
+
+      let endIndex = chartPointTimes.findIndex((ms) => Number.isFinite(ms) && ms > futureCutoff)
+      if (endIndex === -1) {
+        endIndex = chartPoints.length
+      }
+
+      if (endIndex <= startIndex) {
+        endIndex = Math.min(chartPoints.length, startIndex + 1)
+      }
+
+      return {
+        start: Math.max(0, startIndex),
+        end: Math.min(chartPoints.length, Math.max(startIndex + 1, endIndex)),
+      }
+    }
+
+    if (baseOverlayLimitIndex < 0) {
+      return { start: 0, end: 0 }
+    }
+
+    return { start: 0, end: Math.min(baseOverlayLimitIndex + 1, chartPoints.length) }
+  }, [chartPoints, chartPointTimes, showFutureData, effectiveCenterTimestamp, baseOverlayLimitIndex])
+
+  const visibleStartIndex = visibleRange.start
+  const visibleEndIndex = visibleRange.end
+
+  const overlayLimitIndex = useMemo(() => {
+    if (visibleEndIndex <= visibleStartIndex) return -1
+    if (showFutureData) {
+      return visibleEndIndex - visibleStartIndex - 1
+    }
+    const limit = Math.min(baseOverlayLimitIndex, visibleEndIndex - 1)
+    if (limit < visibleStartIndex) {
+      return visibleEndIndex - visibleStartIndex - 1
+    }
+    return limit - visibleStartIndex
+  }, [showFutureData, baseOverlayLimitIndex, visibleStartIndex, visibleEndIndex])
+
+  const overlayAbsoluteEndIndex = overlayLimitIndex >= 0 ? visibleStartIndex + overlayLimitIndex : -1
+
+  const visibleChartPoints = useMemo(
+    () => chartPoints.slice(visibleStartIndex, visibleEndIndex),
+    [chartPoints, visibleEndIndex, visibleStartIndex],
+  )
+
+  const pointCount = visibleChartPoints.length
 
   const centerPosition = useMemo(() => {
     if (!effectiveCenterTimestamp || visibleChartPoints.length === 0) return null
@@ -588,8 +653,10 @@ export default function PriceWindowChart({
     return MOVING_AVERAGE_CONFIG.map((cfg) => {
       const series = computeSMA(closes, cfg.period)
       const commands: string[] = []
-      for (let i = 0; i < series.length && i <= overlayLimitIndex; i += 1) {
-        const value = series[i]
+      for (let i = 0; i <= overlayLimitIndex; i += 1) {
+        const absoluteIndex = visibleStartIndex + i
+        if (absoluteIndex >= series.length) break
+        const value = series[absoluteIndex]
         if (value == null) continue
         const x = xForIndex(i)
         const y = priceValueToY(value)
@@ -598,7 +665,7 @@ export default function PriceWindowChart({
       if (commands.length < 2) return null
       return { period: cfg.period, color: cfg.color, path: commands.join(' ') }
     }).filter((entry): entry is { period: number; color: string; path: string } => entry !== null)
-  }, [closes, overlayLimitIndex, lineShape, xForIndex])
+  }, [closes, overlayLimitIndex, lineShape, visibleStartIndex, xForIndex])
 
   const bollingerBands = useMemo(() => {
     if (!lineShape || overlayLimitIndex < bollingerPeriod - 1) return null
@@ -606,9 +673,12 @@ export default function PriceWindowChart({
     const std = computeRollingStd(closes, bollingerPeriod)
     const upper: { x: number; y: number }[] = []
     const lower: { x: number; y: number }[] = []
-    for (let i = bollingerPeriod - 1; i < closes.length && i <= overlayLimitIndex; i += 1) {
-      const mean = sma[i]
-      const deviation = std[i]
+    for (let i = 0; i <= overlayLimitIndex; i += 1) {
+      const absoluteIndex = visibleStartIndex + i
+      if (absoluteIndex < bollingerPeriod - 1) continue
+      if (absoluteIndex >= closes.length) break
+      const mean = sma[absoluteIndex]
+      const deviation = std[absoluteIndex]
       if (mean == null || deviation == null) continue
       const upperValue = mean + bollingerStd * deviation
       const lowerValue = mean - bollingerStd * deviation
@@ -628,11 +698,12 @@ export default function PriceWindowChart({
       .map((point) => `L${point.x.toFixed(1)},${point.y.toFixed(1)}`)
       .join(' ')} Z`
     return { areaPath, upperPath, lowerPath }
-  }, [closes, overlayLimitIndex, lineShape, bollingerPeriod, bollingerStd, xForIndex])
+  }, [closes, overlayLimitIndex, lineShape, bollingerPeriod, bollingerStd, visibleStartIndex, xForIndex])
 
   const trendLinePath = useMemo(() => {
     if (!lineShape || overlayLimitIndex < 1 || closes.length === 0) return null
-    const endIndex = overlayLimitIndex
+    if (overlayAbsoluteEndIndex < 0) return null
+    const endIndex = overlayAbsoluteEndIndex
     const startIndex = Math.max(0, endIndex - trendLookback + 1)
     if (endIndex - startIndex < 1) return null
     const slice = closes.slice(startIndex, endIndex + 1)
@@ -651,13 +722,15 @@ export default function PriceWindowChart({
     const coords: { x: number; y: number }[] = []
     for (let i = 0; i < slice.length; i += 1) {
       const price = Math.exp(intercept + slope * i)
-      coords.push({ x: xForIndex(startIndex + i), y: priceValueToY(price) })
+      const relativeIndex = startIndex + i - visibleStartIndex
+      if (relativeIndex < 0 || relativeIndex >= visibleChartPoints.length) continue
+      coords.push({ x: xForIndex(relativeIndex), y: priceValueToY(price) })
     }
     if (coords.length < 2) return null
     return coords
       .map((point, idx) => `${idx === 0 ? 'M' : 'L'}${point.x.toFixed(1)},${point.y.toFixed(1)}`)
       .join(' ')
-  }, [closes, lineShape, overlayLimitIndex, trendLookback, xForIndex])
+  }, [closes, lineShape, overlayAbsoluteEndIndex, overlayLimitIndex, trendLookback, visibleChartPoints.length, visibleStartIndex, xForIndex])
 
   const rsiSeries = useMemo(() => computeRSI(closes, rsiPeriod), [closes, rsiPeriod])
   const mfiSeries = useMemo(() => computeMFI(chartRows, mfiPeriod), [chartRows, mfiPeriod])
@@ -668,7 +741,7 @@ export default function PriceWindowChart({
   const macdSignal = macdSeries.signal
   const macdHist = macdSeries.hist
 
-  const latestIndex = overlayLimitIndex >= 0 ? Math.min(overlayLimitIndex, closes.length - 1) : -1
+  const latestIndex = overlayAbsoluteEndIndex >= 0 ? Math.min(overlayAbsoluteEndIndex, closes.length - 1) : -1
   const latestClose = latestIndex >= 0 ? closes[latestIndex] ?? null : null
   const latestRsi = latestIndex >= 0 ? rsiSeries[latestIndex] ?? null : null
   const latestMfi = latestIndex >= 0 ? mfiSeries[latestIndex] ?? null : null
@@ -678,8 +751,10 @@ export default function PriceWindowChart({
   const rsiPath = useMemo(() => {
     if (overlayLimitIndex < 1) return null
     const commands: string[] = []
-    for (let i = 0; i < rsiSeries.length && i <= overlayLimitIndex; i += 1) {
-      const value = rsiSeries[i]
+    for (let i = 0; i <= overlayLimitIndex; i += 1) {
+      const absoluteIndex = visibleStartIndex + i
+      if (absoluteIndex >= rsiSeries.length) break
+      const value = rsiSeries[absoluteIndex]
       if (value == null || Number.isNaN(value)) continue
       const ratio = Math.min(1, Math.max(0, value / 100))
       const y = rsiTop + (1 - ratio) * RSI_AREA_HEIGHT
@@ -687,13 +762,15 @@ export default function PriceWindowChart({
       commands.push(`${commands.length === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`)
     }
     return commands.length < 2 ? null : commands.join(' ')
-  }, [overlayLimitIndex, rsiSeries, xForIndex])
+  }, [overlayLimitIndex, rsiSeries, visibleStartIndex, xForIndex])
 
   const mfiPath = useMemo(() => {
     if (overlayLimitIndex < mfiPeriod - 1) return null
     const commands: string[] = []
-    for (let i = 0; i < mfiSeries.length && i <= overlayLimitIndex; i += 1) {
-      const value = mfiSeries[i]
+    for (let i = 0; i <= overlayLimitIndex; i += 1) {
+      const absoluteIndex = visibleStartIndex + i
+      if (absoluteIndex >= mfiSeries.length) break
+      const value = mfiSeries[absoluteIndex]
       if (value == null || Number.isNaN(value)) continue
       const ratio = Math.min(1, Math.max(0, value / 100))
       const y = rsiTop + (1 - ratio) * RSI_AREA_HEIGHT
@@ -701,15 +778,16 @@ export default function PriceWindowChart({
       commands.push(`${commands.length === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`)
     }
     return commands.length < 2 ? null : commands.join(' ')
-  }, [mfiPeriod, mfiSeries, overlayLimitIndex, xForIndex])
+  }, [mfiPeriod, mfiSeries, overlayLimitIndex, visibleStartIndex, xForIndex])
 
   const macdMetrics = useMemo(() => {
     if (overlayLimitIndex < 1) return null
     const values: number[] = []
     for (let i = 0; i <= overlayLimitIndex; i += 1) {
-      const lineVal = macdLine[i]
-      const sigVal = macdSignal[i]
-      const histVal = macdHist[i]
+      const absoluteIndex = visibleStartIndex + i
+      const lineVal = macdLine[absoluteIndex]
+      const sigVal = macdSignal[absoluteIndex]
+      const histVal = macdHist[absoluteIndex]
       if (lineVal != null && Number.isFinite(lineVal)) values.push(lineVal)
       if (sigVal != null && Number.isFinite(sigVal)) values.push(sigVal)
       if (histVal != null && Number.isFinite(histVal)) values.push(histVal)
@@ -722,7 +800,7 @@ export default function PriceWindowChart({
       range = Math.abs(max) > 0 ? Math.abs(max) * 2 : 1
     }
     return { min, max, range }
-  }, [macdLine, macdSignal, macdHist, overlayLimitIndex])
+  }, [macdLine, macdSignal, macdHist, overlayLimitIndex, visibleStartIndex])
 
   const macdValueToY = (value: number) => {
     if (!macdMetrics) return macdTop + MACD_AREA_HEIGHT / 2
@@ -733,35 +811,41 @@ export default function PriceWindowChart({
   const macdLinePath = useMemo(() => {
     if (!macdMetrics || overlayLimitIndex < 1) return null
     const commands: string[] = []
-    for (let i = 0; i <= overlayLimitIndex && i < macdLine.length; i += 1) {
-      const value = macdLine[i]
+    for (let i = 0; i <= overlayLimitIndex; i += 1) {
+      const absoluteIndex = visibleStartIndex + i
+      if (absoluteIndex >= macdLine.length) break
+      const value = macdLine[absoluteIndex]
       if (value == null || Number.isNaN(value)) continue
       const x = xForIndex(i)
       const y = macdValueToY(value)
       commands.push(`${commands.length === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`)
     }
     return commands.length < 2 ? null : commands.join(' ')
-  }, [macdMetrics, macdLine, overlayLimitIndex, xForIndex])
+  }, [macdMetrics, macdLine, overlayLimitIndex, visibleStartIndex, xForIndex])
 
   const macdSignalPath = useMemo(() => {
     if (!macdMetrics || overlayLimitIndex < 1) return null
     const commands: string[] = []
-    for (let i = 0; i <= overlayLimitIndex && i < macdSignal.length; i += 1) {
-      const value = macdSignal[i]
+    for (let i = 0; i <= overlayLimitIndex; i += 1) {
+      const absoluteIndex = visibleStartIndex + i
+      if (absoluteIndex >= macdSignal.length) break
+      const value = macdSignal[absoluteIndex]
       if (value == null || Number.isNaN(value)) continue
       const x = xForIndex(i)
       const y = macdValueToY(value)
       commands.push(`${commands.length === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`)
     }
     return commands.length < 2 ? null : commands.join(' ')
-  }, [macdMetrics, macdSignal, overlayLimitIndex, xForIndex])
+  }, [macdMetrics, macdSignal, overlayLimitIndex, visibleStartIndex, xForIndex])
 
   const macdHistogram = useMemo(() => {
     if (!macdMetrics || overlayLimitIndex < 1) return [] as { x: number; y: number; width: number; height: number; positive: boolean }[]
     const bars: { x: number; y: number; width: number; height: number; positive: boolean }[] = []
     const barWidth = Math.max(2, CHART_INNER_WIDTH / Math.max(pointCount, 40))
-    for (let i = 0; i <= overlayLimitIndex && i < macdHist.length; i += 1) {
-      const value = macdHist[i]
+    for (let i = 0; i <= overlayLimitIndex; i += 1) {
+      const absoluteIndex = visibleStartIndex + i
+      if (absoluteIndex >= macdHist.length) break
+      const value = macdHist[absoluteIndex]
       if (value == null || Number.isNaN(value)) continue
       const xCenter = xForIndex(i)
       const x = xCenter - barWidth / 2
@@ -771,21 +855,25 @@ export default function PriceWindowChart({
       bars.push({ x, y: value >= 0 ? y : zero, width: barWidth, height, positive: value >= 0 })
     }
     return bars
-  }, [macdMetrics, macdHist, overlayLimitIndex, pointCount, xForIndex])
+  }, [macdMetrics, macdHist, overlayLimitIndex, pointCount, visibleStartIndex, xForIndex])
 
   const obvPath = useMemo(() => {
     if (overlayLimitIndex < 1) return null
     const values: number[] = []
-    for (let i = 0; i <= overlayLimitIndex && i < obvSeries.length; i += 1) {
-      const value = obvSeries[i]
+    for (let i = 0; i <= overlayLimitIndex; i += 1) {
+      const absoluteIndex = visibleStartIndex + i
+      if (absoluteIndex >= obvSeries.length) break
+      const value = obvSeries[absoluteIndex]
       if (value == null || Number.isNaN(value)) continue
       values.push(value)
     }
     if (values.length < 2) return null
     const maxAbs = Math.max(...values.map((value) => Math.abs(value))) || 1
     const commands: string[] = []
-    for (let i = 0; i <= overlayLimitIndex && i < obvSeries.length; i += 1) {
-      const value = obvSeries[i]
+    for (let i = 0; i <= overlayLimitIndex; i += 1) {
+      const absoluteIndex = visibleStartIndex + i
+      if (absoluteIndex >= obvSeries.length) break
+      const value = obvSeries[absoluteIndex]
       if (value == null || Number.isNaN(value)) continue
       const normalized = value / maxAbs
       const y = macdTop + MACD_AREA_HEIGHT / 2 - normalized * (MACD_AREA_HEIGHT * 0.4)
@@ -793,7 +881,7 @@ export default function PriceWindowChart({
       commands.push(`${commands.length === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`)
     }
     return commands.length < 2 ? null : commands.join(' ')
-  }, [obvSeries, overlayLimitIndex, xForIndex])
+  }, [obvSeries, overlayLimitIndex, visibleStartIndex, xForIndex])
 
   const timeDomain = useMemo(() => {
     const times = visibleChartPoints
@@ -945,7 +1033,14 @@ export default function PriceWindowChart({
             if (idx > 0) idx -= 1
           }
           if (idx < 0) return null
-          return Math.min(idx, overlayLimitIndex)
+          if (visibleChartPoints.length === 0) return null
+          const relative = idx - visibleStartIndex
+          if (relative <= 0) return 0
+          if (relative >= visibleChartPoints.length) {
+            return Math.min(overlayLimitIndex, visibleChartPoints.length - 1)
+          }
+          if (relative > overlayLimitIndex) return overlayLimitIndex
+          return relative
         }
         const idx = findIndexForDate(ts)
         const x1 = idx != null ? xForIndex(idx) : CHART_PADDING.left
@@ -960,7 +1055,7 @@ export default function PriceWindowChart({
       supports: buildLines(supportEntries, nearestSupportValue),
       resistances: buildLines(resistanceEntries, nearestResistanceValue),
     }
-  }, [supportResistance, overlayLimitIndex, lineShape, overlayRightX, chartPoints, priceValueToY, xForIndex])
+  }, [supportResistance, overlayLimitIndex, lineShape, overlayRightX, chartPoints, priceValueToY, visibleChartPoints.length, visibleStartIndex, xForIndex])
 
   const volatilityOverlay = useMemo(() => {
     if (!volatilityState) return null
