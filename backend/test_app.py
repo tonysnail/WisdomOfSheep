@@ -140,6 +140,69 @@ def test_list_posts_interest_filter(temp_db):
     assert ids == ["p-high"]
 
 
+def test_start_council_analysis_respects_interest_minimum(temp_db, monkeypatch):
+    with backend_app._connect() as conn:
+        conn.execute("INSERT INTO posts (post_id, title) VALUES (?, ?)", ("p-high", "High interest"))
+        conn.execute("INSERT INTO posts (post_id, title) VALUES (?, ?)", ("p-low", "Low interest"))
+        conn.execute(
+            """
+            INSERT INTO council_stage_interest (post_id, status, interest_score, interest_label, interest_why, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("p-high", "ok", 78, "High", "Signal", "2024-03-01T00:00:00Z"),
+        )
+        conn.execute(
+            """
+            INSERT INTO council_stage_interest (post_id, status, interest_score, interest_label, interest_why, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("p-low", "ok", 32, "Low", "Weak", "2024-03-02T00:00:00Z"),
+        )
+        conn.commit()
+
+    captured: dict[str, Any] = {}
+
+    def fake_worker(job_id: str) -> None:
+        captured["job_id"] = job_id
+
+    monkeypatch.setattr(backend_app, "_worker_council_analysis", fake_worker)
+
+    payload = backend_app.CouncilAnalysisStartRequest(interest_min=60.0, repair_missing=True)
+    result = backend_app.start_council_analysis(payload)
+
+    job_id = result["job_id"]
+    assert captured.get("job_id") == job_id
+
+    job = backend_app._load_job(job_id)
+    assert job is not None
+    queue_ids = [entry["post_id"] for entry in job.get("queue", [])]
+
+    assert queue_ids == ["p-high"]
+    assert job.get("skipped_below_threshold") == 1
+
+
+def test_run_research_pipeline_reports_ticker_context(temp_db):
+    post_id = "p-no-ticker"
+    with backend_app._connect() as conn:
+        conn.execute("INSERT INTO posts (post_id, title) VALUES (?, ?)", (post_id, "No ticker"))
+        conn.execute(
+            """
+            INSERT INTO stages (post_id, stage, created_at, payload)
+            VALUES (?, ?, ?, ?)
+            """,
+            (post_id, "summariser", "2024-04-01T00:00:00Z", json.dumps({"summary_bullets": []})),
+        )
+        conn.commit()
+
+    with pytest.raises(backend_app.HTTPException) as exc_info:
+        backend_app._run_research_pipeline(post_id)
+
+    detail = exc_info.value.detail
+    assert isinstance(detail, dict)
+    assert detail.get("error") == "ticker-not-found"
+    assert detail.get("reason") == "no candidate tickers extracted"
+
+
 def test_posts_calendar_counts_by_day(temp_db):
     with backend_app._connect() as conn:
         conn.execute(
