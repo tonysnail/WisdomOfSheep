@@ -232,29 +232,32 @@ export default function App() {
   function formatEta(seconds: number | null): string {
     if (seconds == null) return 'estimating…'
     if (!Number.isFinite(seconds)) return 'estimating…'
-    if (seconds <= 0.5) return '<1s'
+    if (seconds <= 0.5) return '<1sec'
     const total = Math.round(seconds)
     const hours = Math.floor(total / 3600)
     const minutes = Math.floor((total % 3600) / 60)
     const secs = total % 60
     const parts: string[] = []
     if (hours > 0) {
-      parts.push(`${hours}h`)
+      parts.push(`${hours}hr${hours === 1 ? '' : 's'}`)
       if (minutes > 0) {
-        parts.push(`${minutes}m`)
+        parts.push(`${minutes}min`)
+      }
+      if (minutes === 0 && secs > 0) {
+        parts.push(`${secs}sec${secs === 1 ? '' : 's'}`)
       }
     } else {
       if (minutes > 0) {
-        parts.push(`${minutes}m`)
+        parts.push(`${minutes}min`)
       }
       if (minutes < 5 && secs > 0) {
-        parts.push(`${secs}s`)
+        parts.push(`${secs}sec${secs === 1 ? '' : 's'}`)
       } else if (minutes === 0) {
-        parts.push(`${secs}s`)
+        parts.push(`${secs}sec${secs === 1 ? '' : 's'}`)
       }
     }
     if (parts.length === 0) {
-      parts.push(`${secs}s`)
+      parts.push(`${secs}sec${secs === 1 ? '' : 's'}`)
     }
     return parts.join(' ')
   }
@@ -1210,41 +1213,43 @@ export default function App() {
             <span className="toolbar-toggle-label">Council Analysis</span>
           </label>
           <div className="toolbar-progress-group">
-            <div className="council-progress-block">
-              <div
-                className="progress council"
-                title={councilJobTotal ? `${councilJobDone}/${councilJobTotal}` : undefined}
-              >
-                <div style={{ width: `${councilJobPercent}%` }} />
-              </div>
-              {councilJobTotal > 0 && (
-                <div className="muted small">{councilJobRemaining} remaining</div>
-              )}
-              {councilDisplayLog && (
-                <div className="muted small toolbar-log-snippet" title={councilDisplayLog}>
-                  {councilDisplayLog}
+            <div className="council-progress-pair">
+              <div className="council-progress-block">
+                <div
+                  className="progress council"
+                  title={councilJobTotal ? `${councilJobDone}/${councilJobTotal}` : undefined}
+                >
+                  <div style={{ width: `${councilJobPercent}%` }} />
                 </div>
-              )}
-            </div>
-            <div
-              className="eta-progress-block"
-              data-testid="council-eta"
-              title={
-                etaRemainingSeconds != null
-                  ? `~${Math.max(Math.round(etaRemainingSeconds), 0)}s remaining`
-                  : councilJobActive
-                    ? 'Estimating time remaining'
-                    : 'Council analysis idle'
-              }
-            >
-              <div className="eta-progress-label">
-                <span className="muted small">Time remaining</span>
-                <span className={`eta-progress-value${councilJobActive ? '' : ' inactive'}`}>
-                  {etaDisplayText}
-                </span>
+                {councilJobTotal > 0 && (
+                  <div className="muted small">{councilJobRemaining} remaining</div>
+                )}
+                {councilDisplayLog && (
+                  <div className="muted small toolbar-log-snippet" title={councilDisplayLog}>
+                    {councilDisplayLog}
+                  </div>
+                )}
               </div>
-              <div className={`progress eta${councilJobActive ? '' : ' inactive'}`}>
-                <div style={{ width: `${etaPercent}%` }} />
+              <div
+                className="eta-progress-block"
+                data-testid="council-eta"
+                title={
+                  etaRemainingSeconds != null
+                    ? `~${Math.max(Math.round(etaRemainingSeconds), 0)}s remaining`
+                    : councilJobActive
+                      ? 'Estimating time remaining'
+                      : 'Council analysis idle'
+                }
+              >
+                <div className="eta-progress-label">
+                  <span className="muted small">Time remaining</span>
+                  <span className={`eta-progress-value${councilJobActive ? '' : ' inactive'}`}>
+                    {etaDisplayText}
+                  </span>
+                </div>
+                <div className={`progress eta${councilJobActive ? '' : ' inactive'}`}>
+                  <div style={{ width: `${etaPercent}%` }} />
+                </div>
               </div>
             </div>
           </div>
