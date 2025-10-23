@@ -205,7 +205,6 @@ export default function App() {
   const etaPercent = hasEtaTiming && etaBaseSeconds != null && etaBaseSeconds > 0
     ? Math.max(0, Math.min(100, (etaElapsedSeconds / etaBaseSeconds) * 100))
     : 0
-  const showEtaBlock = councilJobActive || councilJobId != null || hasEtaTiming
   const etaDisplayText = councilJobActive ? formatEta(etaRemainingSeconds) : 'idle'
   const councilLastLine = councilLog
     .split(/\r?\n/)
@@ -1229,25 +1228,23 @@ export default function App() {
                 </div>
               )}
             </div>
-            {showEtaBlock && (
-              <div className="eta-progress-block">
-                <div
-                  className={`progress eta${councilJobActive ? '' : ' inactive'}`}
-                  title={
-                    etaRemainingSeconds != null
-                      ? `~${Math.max(Math.round(etaRemainingSeconds), 0)}s remaining`
-                      : councilJobActive
-                        ? 'Estimating time remaining'
-                        : 'Council analysis idle'
-                  }
-                >
-                  <div style={{ width: `${etaPercent}%` }} />
-                </div>
-                <div className={`muted small eta-text${councilJobActive ? '' : ' inactive'}`}>
-                  Time remaining ~ {etaDisplayText}
-                </div>
+            <div className="eta-progress-block">
+              <div
+                className={`progress eta${councilJobActive ? '' : ' inactive'}`}
+                title={
+                  etaRemainingSeconds != null
+                    ? `~${Math.max(Math.round(etaRemainingSeconds), 0)}s remaining`
+                    : councilJobActive
+                      ? 'Estimating time remaining'
+                      : 'Council analysis idle'
+                }
+              >
+                <div style={{ width: `${etaPercent}%` }} />
               </div>
-            )}
+              <div className={`muted small eta-text${councilJobActive ? '' : ' inactive'}`}>
+                Time remaining ~ {etaDisplayText}
+              </div>
+            </div>
           </div>
           <button
             type="button"
