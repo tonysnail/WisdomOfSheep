@@ -338,6 +338,24 @@ details.stage-log pre { margin:8px 0 0; font-size:12px; line-height:1.4; max-hei
 .toolbar-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
 .toolbar-primary { justify-content:flex-start; }
 .toolbar-progress-group { display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+.council-progress-pair {
+  display:flex;
+  align-items:flex-start;
+  gap:16px;
+  flex-wrap:nowrap;
+  overflow-x:auto;
+  padding-bottom:2px;
+}
+.council-progress-pair::-webkit-scrollbar {
+  height:6px;
+}
+.council-progress-pair::-webkit-scrollbar-thumb {
+  background:rgba(91, 221, 255, 0.25);
+  border-radius:999px;
+}
+.council-progress-pair::-webkit-scrollbar-track {
+  background:transparent;
+}
 .toolbar-progress-group .council-progress-block { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
 .toolbar-log-snippet { max-width: 320px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .toolbar-toggle { display:flex; align-items:center; gap:10px; cursor:pointer; user-select:none; font-weight:600; color:var(--muted); }
