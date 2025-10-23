@@ -1080,6 +1080,41 @@ def _record_council_error(
         logging.exception("failed to record council error for %s stage %s", post_id, stage)
 
 
+def _format_council_error_detail(detail: Any) -> str:
+    if isinstance(detail, str):
+        return detail
+    if isinstance(detail, dict):
+        error_text = str(detail.get("error") or detail.get("message") or "").strip()
+        extras: List[str] = []
+        for key, value in detail.items():
+            if key in {"error", "message"}:
+                continue
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple, set)):
+                values = [str(item).strip() for item in value if str(item or "").strip()]
+                if not values:
+                    continue
+                extras.append(f"{key}=[{', '.join(values)}]")
+            else:
+                text = str(value).strip()
+                if not text:
+                    continue
+                extras.append(f"{key}={text}")
+        if extras:
+            extras_text = "; ".join(extras)
+            if error_text:
+                return f"{error_text} ({extras_text})"
+            return extras_text
+        if error_text:
+            return error_text
+        try:
+            return json.dumps(detail, ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            return str(detail)
+    return str(detail)
+
+
 def _now_iso() -> str:
     return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -2239,7 +2274,7 @@ def _worker_council_analysis(job_id: str) -> None:
                             err_output = err or ""
                             raise RuntimeError(err or f"{stage} failed")
                 except HTTPException as exc:
-                    detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+                    detail = _format_council_error_detail(exc.detail)
                     _record_council_error(post_id, stage, label, detail, job_id, log_excerpt=err_output)
                     _job_append_log(job_id, f"✗ {label} failed {post_id}: {detail}")
                     stage_ok = False
@@ -2328,6 +2363,7 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
 
     repair_queue: List[Dict[str, Any]] = []
     repair_ids: Set[str] = set()
+    skipped_below_threshold = 0
 
     with _connect() as conn:
         _ensure_schema(conn)
@@ -2357,14 +2393,18 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
                 pid = str(row["post_id"] or "").strip()
                 if not pid:
                     continue
+                raw_score = row["interest_score"]
+                try:
+                    score_val = float(raw_score if raw_score is not None else 0.0)
+                except (TypeError, ValueError):
+                    score_val = 0.0
+                if score_val < threshold:
+                    skipped_below_threshold += 1
+                    continue
                 entry: Dict[str, Any] = {
                     "post_id": pid,
                     "title": row["title"],
-                    "interest_score": (
-                        float(row["interest_score"])
-                        if row["interest_score"] is not None
-                        else None
-                    ),
+                    "interest_score": score_val,
                     "article_time": row["article_time"] or "",
                     "mode": "repair",
                 }
@@ -2406,11 +2446,19 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
         if int(row["has_chairman"] or 0):
             skipped_with_chairman += 1
             continue
+        raw_score = row["interest_score"]
+        try:
+            score_val = float(raw_score if raw_score is not None else 0.0)
+        except (TypeError, ValueError):
+            score_val = 0.0
+        if score_val < threshold:
+            skipped_below_threshold += 1
+            continue
         interest_queue.append(
             {
                 "post_id": pid,
                 "title": row["title"],
-                "interest_score": float(row["interest_score"] or 0.0),
+                "interest_score": score_val,
                 "article_time": row["article_time"] or "",
                 "mode": "interest",
             }
@@ -2433,6 +2481,7 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
         "current": "",
         "remaining": total,
         "skipped_with_chairman": skipped_with_chairman,
+        "skipped_below_threshold": skipped_below_threshold,
         "repairs_total": len(repair_queue),
         "repairs_done": 0,
         "repair_missing": bool(payload.repair_missing),
@@ -2465,6 +2514,11 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
     if skipped_with_chairman:
         plural = "s" if skipped_with_chairman != 1 else ""
         summary_bits.append(f"(skipped {skipped_with_chairman} post{plural} with chairman verdict)")
+    if skipped_below_threshold:
+        plural_threshold = "s" if skipped_below_threshold != 1 else ""
+        summary_bits.append(
+            f"(skipped {skipped_below_threshold} post{plural_threshold} below {int(round(threshold))}% interest)"
+        )
     summary_line = " ".join(summary_bits)
     _job_append_log(job_id, summary_line)
 
@@ -2488,6 +2542,7 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
             "total": total,
             "interest_min": threshold,
             "skipped_with_chairman": skipped_with_chairman,
+            "skipped_below_threshold": skipped_below_threshold,
             "repairs_total": len(repair_queue),
         }
 
@@ -2500,6 +2555,7 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
         "total": total,
         "interest_min": threshold,
         "skipped_with_chairman": skipped_with_chairman,
+        "skipped_below_threshold": skipped_below_threshold,
         "repairs_total": len(repair_queue),
     }
 
@@ -3348,11 +3404,30 @@ def _run_research_pipeline(post_id: str) -> ResearchPayload:
             candidate_tickers.extend(str(t) for t in convo_candidates if isinstance(t, str))
         candidate_tickers.extend(_extract_convo_tickers(post_row, summariser_payload))
 
+        normalized_candidates: List[str] = []
+        seen_candidates: Set[str] = set()
+        for candidate in candidate_tickers:
+            symbol = (candidate or "").strip().upper()
+            if not symbol or symbol in seen_candidates:
+                continue
+            seen_candidates.add(symbol)
+            normalized_candidates.append(symbol)
+
         ordered_tickers = _filter_valid_tickers(candidate_tickers)
         if not ordered_tickers and primary_ticker:
             ordered_tickers = [primary_ticker]
         if not ordered_tickers:
-            raise HTTPException(status_code=422, detail="ticker-not-found")
+            detail_payload: Dict[str, Any] = {"error": "ticker-not-found"}
+            if primary_ticker:
+                primary_clean = (primary_ticker or "").strip().upper()
+                if primary_clean:
+                    detail_payload["primary_ticker"] = primary_clean
+            if normalized_candidates:
+                detail_payload["candidates"] = normalized_candidates
+                detail_payload["invalid_candidates"] = normalized_candidates
+            else:
+                detail_payload["reason"] = "no candidate tickers extracted"
+            raise HTTPException(status_code=422, detail=detail_payload)
 
         base_input = {
             "article_time": article_time,
