@@ -1227,20 +1227,22 @@ export default function App() {
               )}
             </div>
             <div className="eta-progress-block">
-              <div
-                className={`progress eta${councilJobActive ? '' : ' inactive'}`}
-                title={
-                  etaRemainingSeconds != null
-                    ? `~${Math.max(Math.round(etaRemainingSeconds), 0)}s remaining`
-                    : councilJobActive
-                      ? 'Estimating time remaining'
-                      : 'Council analysis idle'
-                }
-              >
-                <div style={{ width: `${etaPercent}%` }} />
-              </div>
-              <div className={`muted small eta-text${councilJobActive ? '' : ' inactive'}`}>
-                Time remaining ~ {etaDisplayText}
+              <div className="eta-progress-row">
+                <div
+                  className={`progress eta${councilJobActive ? '' : ' inactive'}`}
+                  title={
+                    etaRemainingSeconds != null
+                      ? `~${Math.max(Math.round(etaRemainingSeconds), 0)}s remaining`
+                      : councilJobActive
+                        ? 'Estimating time remaining'
+                        : 'Council analysis idle'
+                  }
+                >
+                  <div style={{ width: `${etaPercent}%` }} />
+                </div>
+                <div className={`muted small eta-text${councilJobActive ? '' : ' inactive'}`}>
+                  Time remaining ~ {etaDisplayText}
+                </div>
               </div>
             </div>
           </div>
