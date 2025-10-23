@@ -1,11 +1,11 @@
 {
-  "count": 0,
-  "sum_duration": 0.0,
+  "count": 80,
+  "sum_duration": 39037.98080253601,
   "sum_article_tokens": 0.0,
   "sum_summary_tokens": 0.0,
   "sum_total_tokens": 0.0,
   "matrix": {
-    "xx00": 0.0,
+    "xx00": 80.0,
     "xx01": 0.0,
     "xx02": 0.0,
     "xx11": 0.0,
@@ -13,7 +13,7 @@
     "xx22": 0.0
   },
   "vector": {
-    "xy0": 0.0,
+    "xy0": 39037.98080253601,
     "xy1": 0.0,
     "xy2": 0.0
   }
