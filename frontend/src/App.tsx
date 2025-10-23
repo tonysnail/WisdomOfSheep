@@ -232,29 +232,32 @@ export default function App() {
   function formatEta(seconds: number | null): string {
     if (seconds == null) return 'estimating…'
     if (!Number.isFinite(seconds)) return 'estimating…'
-    if (seconds <= 0.5) return '<1s'
+    if (seconds <= 0.5) return '<1sec'
     const total = Math.round(seconds)
     const hours = Math.floor(total / 3600)
     const minutes = Math.floor((total % 3600) / 60)
     const secs = total % 60
     const parts: string[] = []
     if (hours > 0) {
-      parts.push(`${hours}h`)
+      parts.push(`${hours}hr${hours === 1 ? '' : 's'}`)
       if (minutes > 0) {
-        parts.push(`${minutes}m`)
+        parts.push(`${minutes}min`)
+      }
+      if (minutes === 0 && secs > 0) {
+        parts.push(`${secs}sec${secs === 1 ? '' : 's'}`)
       }
     } else {
       if (minutes > 0) {
-        parts.push(`${minutes}m`)
+        parts.push(`${minutes}min`)
       }
       if (minutes < 5 && secs > 0) {
-        parts.push(`${secs}s`)
+        parts.push(`${secs}sec${secs === 1 ? '' : 's'}`)
       } else if (minutes === 0) {
-        parts.push(`${secs}s`)
+        parts.push(`${secs}sec${secs === 1 ? '' : 's'}`)
       }
     }
     if (parts.length === 0) {
-      parts.push(`${secs}s`)
+      parts.push(`${secs}sec${secs === 1 ? '' : 's'}`)
     }
     return parts.join(' ')
   }
