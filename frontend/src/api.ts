@@ -169,13 +169,19 @@ export type RefreshSummariesMode = 'full' | 'new_only'
 
 export async function startRefreshSummaries(options?: {
   mode?: RefreshSummariesMode
+  collectNewPosts?: boolean
 }): Promise<{
   ok: boolean
   job_id: string
   total: number
   conflict?: boolean
 }> {
-  const body = options?.mode ? JSON.stringify({ mode: options.mode }) : null
+  const payload: Record<string, unknown> = {}
+  if (options?.mode) payload.mode = options.mode
+  if (typeof options?.collectNewPosts === 'boolean') {
+    payload.collect_new_posts = options.collectNewPosts
+  }
+  const body = Object.keys(payload).length > 0 ? JSON.stringify(payload) : null
   const headers = body ? { 'Content-Type': 'application/json' } : undefined
   const res = await fetch(`${API}/api/refresh-summaries/start`, {
     method: 'POST',
@@ -216,6 +222,11 @@ export type RefreshJob = {
   current: string
   message: string
   log_tail: string[]
+  new_posts?: {
+    post_id: string
+    title?: string | null
+    interest_score?: number | null
+  }[]
 }
 
 export async function getRefreshJob(jobId: string): Promise<RefreshJob> {
@@ -266,6 +277,7 @@ export type CouncilJob = {
 export async function startCouncilAnalysis(options: {
   interest_min: number
   repair_missing?: boolean
+  postIds?: string[]
 }): Promise<{
   ok: boolean
   job_id: string
@@ -274,9 +286,12 @@ export async function startCouncilAnalysis(options: {
   repairs_total: number
   conflict?: boolean
 }> {
-  const body = {
+  const body: Record<string, unknown> = {
     interest_min: options.interest_min,
     repair_missing: Boolean(options.repair_missing),
+  }
+  if (options.postIds && options.postIds.length > 0) {
+    body.post_ids = options.postIds
   }
   const res = await fetch(`${API}/api/council-analysis/start`, {
     method: 'POST',
