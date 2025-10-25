@@ -41,6 +41,15 @@ const normalizeTicker = (value?: string | null): string => {
   return value.trim().toUpperCase()
 }
 
+const parseInterestScore = (value: unknown): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string') {
+    const parsed = Number.parseFloat(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return null
+}
+
 const STORAGE_KEYS = {
   selectedDate: 'wos.selectedDate',
   selectedPost: 'wos.selectedPostId',
@@ -48,6 +57,8 @@ const STORAGE_KEYS = {
   interestMin: 'wos.interestMin',
   councilJob: 'wos.councilJobId',
   councilPrimed: 'wos.councilPrimedMissing',
+  analyseNewActive: 'wos.analyseNewActive',
+  analyseNewThreshold: 'wos.analyseNewThreshold',
 } as const
 
 type CouncilProgressState = {
@@ -123,6 +134,18 @@ export default function App() {
     if (typeof window === 'undefined') return false
     return window.localStorage.getItem(STORAGE_KEYS.councilPrimed) === '1'
   })
+  const [analyseNewActive, setAnalyseNewActive] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false
+    return window.localStorage.getItem(STORAGE_KEYS.analyseNewActive) === '1'
+  })
+  const [analyseNewThreshold, setAnalyseNewThreshold] = useState<number | null>(() => {
+    if (typeof window === 'undefined') return null
+    const stored = window.localStorage.getItem(STORAGE_KEYS.analyseNewThreshold)
+    if (!stored) return null
+    const parsed = Number.parseFloat(stored)
+    return Number.isFinite(parsed) ? parsed : null
+  })
+  const [analyseNewCouncilStarted, setAnalyseNewCouncilStarted] = useState(false)
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -188,6 +211,7 @@ export default function App() {
   const councilJobActive = councilJob
     ? councilJob.status === 'queued' || councilJob.status === 'running' || councilJob.status === 'cancelling'
     : Boolean(councilJobId)
+  const interestSliderDisabled = councilJobActive || analyseNewActive
   const etaBaseSeconds =
     typeof councilJob?.current_eta_seconds === 'number' && councilJob.current_eta_seconds > 0
       ? councilJob.current_eta_seconds
@@ -212,7 +236,7 @@ export default function App() {
     .filter((line) => line.length > 0)
     .pop() || ''
   const councilDisplayLog = (councilLogEntry || councilJobMessage || councilLastLine).trim()
-  const panelDisabled = busy || jobBusy || councilJobBusy
+  const panelDisabled = busy || jobBusy || councilJobBusy || analyseNewActive
 
   const deriveLogSnippet = (value: string): string => {
     const trimmed = value.trim()
@@ -288,6 +312,32 @@ export default function App() {
     const timer = window.setTimeout(() => setCouncilCopyStatus('idle'), 2000)
     return () => window.clearTimeout(timer)
   }, [councilCopyStatus])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined
+    if (analyseNewActive) {
+      window.localStorage.setItem(STORAGE_KEYS.analyseNewActive, '1')
+    } else {
+      window.localStorage.removeItem(STORAGE_KEYS.analyseNewActive)
+    }
+    return undefined
+  }, [analyseNewActive])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined
+    if (analyseNewThreshold != null && Number.isFinite(analyseNewThreshold)) {
+      window.localStorage.setItem(STORAGE_KEYS.analyseNewThreshold, String(analyseNewThreshold))
+    } else {
+      window.localStorage.removeItem(STORAGE_KEYS.analyseNewThreshold)
+    }
+    return undefined
+  }, [analyseNewThreshold])
+
+  useEffect(() => {
+    if (!analyseNewActive) {
+      setAnalyseNewCouncilStarted(false)
+    }
+  }, [analyseNewActive])
 
   const appendLog = (entry: string) => {
     const trimmedEntry = entry.trim()
@@ -505,6 +555,22 @@ export default function App() {
               }
             }
           }
+          if (!cancelled && analyseNewActive && analyseNewCouncilStarted) {
+            const statusMessage =
+              job.status === 'done'
+                ? 'Analyse New Articles completed.'
+                : job.status === 'cancelled'
+                  ? 'Analyse New Articles cancelled.'
+                  : job.status === 'error'
+                    ? 'Analyse New Articles encountered an error.'
+                    : ''
+            if (statusMessage) {
+              updateLog((prev) => prev || statusMessage)
+            }
+            setAnalyseNewActive(false)
+            setAnalyseNewThreshold(null)
+            setAnalyseNewCouncilStarted(false)
+          }
           if (!cancelled) {
             setCouncilJobId(null)
           }
@@ -535,6 +601,8 @@ export default function App() {
     queryKey.date_to,
     queryKey.interest_min,
     pickedId,
+    analyseNewActive,
+    analyseNewCouncilStarted,
   ])
 
   useEffect(() => {
@@ -804,6 +872,80 @@ export default function App() {
 
         const doneCount = job.done ?? 0
         const terminal = job.status === 'done' || job.status === 'error' || job.status === 'cancelled'
+        if (analyseNewActive && !analyseNewCouncilStarted && terminal && !cancelled) {
+          if (job.status === 'done') {
+            const thresholdBase = analyseNewThreshold ?? interestFilter
+            const thresholdValue = Math.max(0, Math.min(thresholdBase, 100))
+            const newPosts = Array.isArray(job.new_posts) ? job.new_posts : []
+            const selected = newPosts
+              .map((entry) => {
+                const postId = typeof entry?.post_id === 'string' ? entry.post_id.trim() : ''
+                const score = parseInterestScore(entry?.interest_score)
+                return { postId, score }
+              })
+              .filter((entry) => entry.postId && entry.score != null && entry.score >= thresholdValue)
+              .map((entry) => entry.postId)
+            if (selected.length > 0) {
+              setAnalyseNewCouncilStarted(true)
+              try {
+                const res = await startCouncilAnalysis({
+                  interest_min: thresholdValue,
+                  postIds: selected,
+                })
+                if (cancelled) return
+                setCouncilJobId(res.job_id)
+                if (!res.conflict) {
+                  setCouncilLog('')
+                  setCouncilLogEntry('')
+                  setCouncilCopyStatus('idle')
+                  setCouncilJob({
+                    id: res.job_id,
+                    status: res.total > 0 ? 'queued' : 'done',
+                    total: res.total,
+                    done: 0,
+                    remaining: res.total,
+                    interest_min: res.interest_min,
+                    repairs_total: res.repairs_total ?? 0,
+                    repairs_done: 0,
+                    log_tail: [],
+                    message: '',
+                    error: undefined,
+                    current_eta_seconds: null,
+                    current_started_at: null,
+                    current_mode: null,
+                    current_article_tokens: null,
+                    current_summary_tokens: null,
+                  })
+                  setCouncilJobBusy(res.total > 0)
+                } else {
+                  setCouncilJobBusy(true)
+                  setCouncilLogEntry((prev) => prev || 'Council analysis already running.')
+                  updateLog((prev) => prev || 'Council analysis already running.')
+                  setAnalyseNewActive(false)
+                  setAnalyseNewThreshold(null)
+                  setAnalyseNewCouncilStarted(false)
+                }
+              } catch (err: any) {
+                if (!cancelled) {
+                  updateLog(`Council start error: ${err.message}`)
+                  setAnalyseNewActive(false)
+                  setAnalyseNewThreshold(null)
+                  setAnalyseNewCouncilStarted(false)
+                }
+              }
+            } else {
+              updateLog((prev) => prev || 'No new articles met the interest threshold; council analysis skipped.')
+              setAnalyseNewActive(false)
+              setAnalyseNewThreshold(null)
+              setAnalyseNewCouncilStarted(false)
+            }
+          } else {
+            setAnalyseNewActive(false)
+            setAnalyseNewThreshold(null)
+            setAnalyseNewCouncilStarted(false)
+          }
+        }
+
         const shouldRefreshList = (doneCount > 0 && doneCount !== lastListRefresh.current && doneCount % 5 === 0) || terminal
         if (shouldRefreshList) {
           try {
@@ -840,6 +982,10 @@ export default function App() {
     queryKey.page_size,
     queryKey.date_from,
     queryKey.date_to,
+    analyseNewActive,
+    analyseNewCouncilStarted,
+    analyseNewThreshold,
+    interestFilter,
   ])
 
   async function onClearAnalysis() {
@@ -918,6 +1064,62 @@ export default function App() {
     } catch (e: any) {
       setJobBusy(false)
       updateLog(`Start error: ${e.message}`)
+    }
+  }
+
+  const resetAnalyseNewState = () => {
+    setAnalyseNewActive(false)
+    setAnalyseNewThreshold(null)
+    setAnalyseNewCouncilStarted(false)
+  }
+
+  async function handleAnalyseNewToggle(next: boolean) {
+    if (next) {
+      if (working || jobActive || councilJobActive || councilJobBusy) {
+        updateLog((prev) => prev || 'Finish current jobs before analysing new articles.')
+        resetAnalyseNewState()
+        return
+      }
+      const thresholdValue = Math.max(0, Math.min(interestFilter, 100))
+      setAnalyseNewActive(true)
+      setAnalyseNewCouncilStarted(false)
+      setAnalyseNewThreshold(thresholdValue)
+      setRefreshJob(null)
+      setJobBusy(true)
+      try {
+        const start = await startRefreshSummaries({ mode: 'new_only', collectNewPosts: true })
+        setRefreshJobId(start.job_id)
+        if (start.conflict) {
+          setJobBusy(false)
+          updateLog((prev) => prev || 'A refresh job is already running.')
+          resetAnalyseNewState()
+          return
+        }
+        updateLog((prev) => prev || 'Analyse New Articles started.')
+      } catch (e: any) {
+        setJobBusy(false)
+        updateLog(`Start error: ${e.message}`)
+        resetAnalyseNewState()
+      }
+      return
+    }
+
+    const refreshId = refreshJobId
+    const councilId = councilJobId
+    resetAnalyseNewState()
+    if (refreshId) {
+      try {
+        await stopRefreshJob(refreshId)
+      } catch (e: any) {
+        updateLog((prev) => `${prev ? `${prev}\n` : ''}Stop error: ${e.message}`)
+      }
+    }
+    if (councilId) {
+      try {
+        await stopCouncilJob(councilId)
+      } catch (e: any) {
+        updateLog((prev) => `${prev ? `${prev}\n` : ''}Council stop error: ${e.message}`)
+      }
     }
   }
 
@@ -1173,10 +1375,13 @@ export default function App() {
 
       <div className="toolbar">
         <div className="toolbar-row toolbar-primary">
-          <button onClick={jobActive ? onStopRefreshSummaries : onRefreshSummaries} disabled={!jobActive && working}>
+          <button
+            onClick={jobActive ? onStopRefreshSummaries : onRefreshSummaries}
+            disabled={(!jobActive && working) || analyseNewActive}
+          >
             {jobActive ? 'Stop Refresh' : 'Summarise and Backfill'}
           </button>
-          <button onClick={onSummariseNewArticles} disabled={jobActive || working}>
+          <button onClick={onSummariseNewArticles} disabled={jobActive || working || analyseNewActive}>
             Summarise New Articles
           </button>
 
@@ -1208,6 +1413,7 @@ export default function App() {
                   onStopCouncilProcessing()
                 }
               }}
+              disabled={analyseNewActive || working || councilJobBusy}
             />
             <span className="toolbar-toggle-track" />
             <span className="toolbar-toggle-label">Council Analysis</span>
@@ -1257,20 +1463,35 @@ export default function App() {
             type="button"
             className="toolbar-danger"
             onClick={onEraseAllCouncilAnalysis}
-            disabled={working || councilJobActive || councilJobBusy}
+            disabled={working || councilJobActive || councilJobBusy || analyseNewActive}
             title="Remove council analysis outputs for all posts"
           >
             Erase all Council Analysis
           </button>
         </div>
 
+        <div className="toolbar-row toolbar-analyse-new">
+          <label className={`toolbar-toggle${analyseNewActive ? ' active' : ''}`}>
+            <input
+              type="checkbox"
+              checked={analyseNewActive}
+              onChange={(event) => handleAnalyseNewToggle(event.target.checked)}
+              disabled={
+                working || (!analyseNewActive && (jobActive || councilJobActive || councilJobBusy))
+              }
+            />
+            <span className="toolbar-toggle-track" />
+            <span className="toolbar-toggle-label">Analyse New Articles</span>
+          </label>
+        </div>
+
         <div className="toolbar-row toolbar-slider">
           <label
             htmlFor="interest-filter"
-            className={councilJobActive ? 'disabled' : undefined}
+            className={interestSliderDisabled ? 'disabled' : undefined}
             title={
-              councilJobActive
-                ? 'Interest threshold is locked while council analysis runs.'
+              interestSliderDisabled
+                ? 'Interest threshold is locked while analysis runs.'
                 : undefined
             }
           >
@@ -1283,8 +1504,8 @@ export default function App() {
             max={100}
             step={5}
             value={interestFilter}
-            disabled={councilJobActive}
-            aria-disabled={councilJobActive}
+            disabled={interestSliderDisabled}
+            aria-disabled={interestSliderDisabled}
             onChange={(e) => {
               const next = Number(e.target.value)
               handleInterestThresholdChange(Number.isNaN(next) ? 0 : next)

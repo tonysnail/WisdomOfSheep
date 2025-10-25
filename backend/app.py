@@ -1769,6 +1769,7 @@ def _worker_refresh_summaries(job_id: str):
     snap_path = Path(job["snapshot"])
     backlog: List[Dict[str, Any]] = list(job.get("backlog") or [])
     only_new = bool(job.get("only_new"))
+    collect_new_posts = bool(job.get("collect_new_posts"))
     backlog_total = len(backlog)
     csv_total = int(job.get("csv_total") or max(int(job.get("total", 0)) - backlog_total, 0))
     existing_posts: set[str] = set()
@@ -1846,11 +1847,11 @@ def _worker_refresh_summaries(job_id: str):
         status = _norm_optional_str(row["status"]) or ""
         return status.lower() != "ok"
 
-    def _run_interest_for_post(pid: str, title: str = "") -> None:
+    def _run_interest_for_post(pid: str, title: str = "") -> Optional[Dict[str, Any]]:
         if not _interest_supported():
-            return
+            return None
         if not _ensure_not_cancelled():
-            return
+            return None
         try:
             result = compute_interest_for_post(
                 pid,
@@ -1861,7 +1862,7 @@ def _worker_refresh_summaries(job_id: str):
         except Exception as exc:  # noqa: BLE001
             logging.exception("interest scoring failed for %s", pid)
             _job_append_log(job_id, f"✗ interest error {pid}: {exc}")
-            return
+            return None
 
         status = _norm_optional_str(result.get("status")) or ""
         ticker = _norm_optional_str(result.get("ticker")) or ""
@@ -1880,6 +1881,28 @@ def _worker_refresh_summaries(job_id: str):
             reason = _norm_optional_str(result.get("error_code")) or _norm_optional_str(result.get("error_message")) or "failed"
             suffix = f" [{ticker}]" if ticker else ""
             _job_append_log(job_id, f"⚠ interest failed {pid}{suffix}: {reason}")
+        return result
+
+    def _record_new_post(pid: str, title: str, interest_score: Optional[float]) -> None:
+        if not collect_new_posts:
+            return
+
+        safe_pid = (pid or "").strip()
+        if not safe_pid:
+            return
+
+        def mutate(data: Dict[str, Any]) -> None:
+            entries = list(data.get("new_posts") or [])
+            entry: Dict[str, Any] = {"post_id": safe_pid}
+            safe_title = (title or "").strip()
+            if safe_title:
+                entry["title"] = safe_title
+            if interest_score is not None:
+                entry["interest_score"] = interest_score
+            entries.append(entry)
+            data["new_posts"] = entries
+
+        _job_mutate(job_id, mutate)
 
     def _backfill_interest_scores(conn: sqlite3.Connection) -> None:
         if not _interest_supported():
@@ -2115,15 +2138,24 @@ def _worker_refresh_summaries(job_id: str):
                         except Exception as exc:  # noqa: BLE001
                             logging.exception("conversation hub ingest failed for %s", pid)
                             _job_append_log(job_id, f"✗ convo hub failed {pid}: {exc}")
+                        interest_result: Optional[Dict[str, Any]] = None
                         try:
                             if _should_run_interest(conn, pid):
                                 _interest_schedule(1)
                                 _interest_before_run("Interest snapshot", pid, title)
-                                _run_interest_for_post(pid, title)
+                                interest_result = _run_interest_for_post(pid, title)
                                 _interest_after_run()
                         except Exception as exc:  # noqa: BLE001
                             logging.exception("interest scoring check failed for %s", pid)
                             _job_append_log(job_id, f"⚠ interest check failed {pid}: {exc}")
+                        interest_score_val: Optional[float] = None
+                        if interest_result is not None:
+                            raw_score = interest_result.get("interest_score")
+                            try:
+                                interest_score_val = float(raw_score) if raw_score is not None else None
+                            except (TypeError, ValueError):
+                                interest_score_val = None
+                        _record_new_post(pid, title, interest_score_val)
                     else:
                         _job_append_log(job_id, f"✗ summariser exit {code} for {pid}")
 
@@ -2341,12 +2373,26 @@ def _worker_council_analysis(job_id: str) -> None:
 class CouncilAnalysisStartRequest(BaseModel):
     interest_min: float = Field(0.0, ge=0.0, le=100.0)
     repair_missing: bool = False
+    post_ids: Optional[List[str]] = None
 
 
 @app.post("/api/council-analysis/start")
 def start_council_analysis(payload: CouncilAnalysisStartRequest):
     global ACTIVE_COUNCIL_JOB_ID
     threshold = float(payload.interest_min)
+    target_post_order: Dict[str, int] = {}
+    target_post_ids: Optional[Set[str]] = None
+    if payload.post_ids is not None:
+        cleaned: List[str] = []
+        for raw in payload.post_ids:
+            pid = str(raw or "").strip()
+            if not pid:
+                continue
+            if pid in target_post_order:
+                continue
+            target_post_order[pid] = len(cleaned)
+            cleaned.append(pid)
+        target_post_ids = set(cleaned)
 
     with COUNCIL_JOB_LOCK:
         if ACTIVE_COUNCIL_JOB_ID:
@@ -2392,6 +2438,8 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
             for row in repair_rows:
                 pid = str(row["post_id"] or "").strip()
                 if not pid:
+                    continue
+                if target_post_ids is not None and pid not in target_post_ids:
                     continue
                 raw_score = row["interest_score"]
                 try:
@@ -2443,6 +2491,8 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
         pid = str(row["post_id"] or "").strip()
         if not pid or pid in repair_ids:
             continue
+        if target_post_ids is not None and pid not in target_post_ids:
+            continue
         if int(row["has_chairman"] or 0):
             skipped_with_chairman += 1
             continue
@@ -2467,6 +2517,11 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
     repair_queue.sort(key=lambda entry: (entry.get("article_time") or "", entry.get("post_id")))
     interest_queue.sort(key=lambda entry: (entry.get("article_time") or "", entry.get("post_id")))
     queue: List[Dict[str, Any]] = repair_queue + interest_queue
+
+    if target_post_ids is not None:
+        queue = [entry for entry in queue if entry.get("post_id") in target_post_ids]
+        if target_post_order:
+            queue.sort(key=lambda entry: target_post_order.get(entry.get("post_id"), len(target_post_order)))
 
     total = len(queue)
     now = time.time()
@@ -2501,13 +2556,21 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
 
     _job_save(job_data)
 
-    summary_bits = [
-        (
-            f"→ queued {total} post(s) for council analysis at ≥{int(round(threshold))}%"
-            if total > 0
+    if total > 0:
+        if target_post_ids is not None:
+            summary_bits = [
+                f"→ queued {total} selected post(s) for council analysis at ≥{int(round(threshold))}%"
+            ]
+        else:
+            summary_bits = [
+                f"→ queued {total} post(s) for council analysis at ≥{int(round(threshold))}%"
+            ]
+    else:
+        summary_bits = [
+            "→ no selected posts meet the council threshold"
+            if target_post_ids is not None
             else "→ no posts meet the council threshold"
-        )
-    ]
+        ]
     if repair_queue:
         plural_repair = "s" if len(repair_queue) != 1 else ""
         summary_bits.append(f"(repairing {len(repair_queue)} missing verdict{plural_repair})")
@@ -3137,6 +3200,7 @@ def clear_post_analysis(post_id: str):
 
 class RefreshSummariesStartRequest(BaseModel):
     mode: Literal["full", "new_only"] = "full"
+    collect_new_posts: bool = False
 
 
 @app.post("/api/refresh-summaries/start")
@@ -3173,6 +3237,7 @@ def start_refresh_summaries(
 
     requested_mode = payload.mode if payload else "full"
     only_new = requested_mode == "new_only"
+    collect_new_posts = bool(payload.collect_new_posts) if payload else False
 
     backlog: List[Dict[str, Any]] = []
     summarised_ids: set[str] = set()
@@ -3260,6 +3325,7 @@ def start_refresh_summaries(
         "backlog": backlog,
         "mode": requested_mode,
         "only_new": only_new,
+        "collect_new_posts": collect_new_posts,
         "csv_total": csv_total,
         "total": total,
         "done": 0,
@@ -3272,6 +3338,7 @@ def start_refresh_summaries(
         "cancelled": False,
         "created_at": now,
         "updated_at": now,
+        "new_posts": [],
     }
     _job_save(job)
 
