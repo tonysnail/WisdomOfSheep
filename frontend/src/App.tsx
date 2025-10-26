@@ -172,6 +172,15 @@ export default function App() {
     syncAnalyseNewInFlight()
   }, [syncAnalyseNewPending, syncAnalyseNewInFlight])
 
+  const resetAnalyseNewState = useCallback(() => {
+    clearAnalyseNewQueues()
+    setAnalyseNewActive(false)
+    setAnalyseNewThreshold(null)
+    setAnalyseNewCouncilStarted(false)
+    setAnalyseNewRefreshComplete(false)
+    setAnalyseNewHadEligible(false)
+  }, [clearAnalyseNewQueues])
+
   useEffect(() => {
     if (typeof window === 'undefined') return
     if (!selectedDate) {
@@ -1177,15 +1186,6 @@ export default function App() {
       updateLog(`Start error: ${e.message}`)
     }
   }
-
-  const resetAnalyseNewState = useCallback(() => {
-    clearAnalyseNewQueues()
-    setAnalyseNewActive(false)
-    setAnalyseNewThreshold(null)
-    setAnalyseNewCouncilStarted(false)
-    setAnalyseNewRefreshComplete(false)
-    setAnalyseNewHadEligible(false)
-  }, [clearAnalyseNewQueues])
 
   async function handleAnalyseNewToggle(next: boolean) {
     if (next) {
