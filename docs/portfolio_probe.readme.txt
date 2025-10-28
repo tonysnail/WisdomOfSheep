@@ -1,0 +1,425 @@
+portfolio_probe.py — User Guide & Reference
+What it is
+
+portfolio_probe.py is the Portfolio Manager probe / backtester / GA optimizer for Wisdom Of Sheep. It turns your Chairman verdicts into concrete trading rules, simulates trades on historical data (daily or intraday), and—optionally—runs a Genetic Algorithm (GA) to discover better parameter sets.
+
+It’s built to be:
+
+Chairman-aware: every important field from the verdict can be a decision gate or gene.
+
+Read-only on your DB: writes nothing to council/wisdom_of_sheep.sql.
+
+Reproducible: writes all outputs to ./portfolio/.
+
+Null-tolerant: imputes missing metrics so learning doesn’t silently drop signals.
+
+Inputs & Outputs
+Inputs
+
+council/wisdom_of_sheep.sql (read-only)
+Uses a TEMP VIEW (chairman_flat_v3) over:
+
+stages (stage='chairman'): canonical source of Chairman JSON payloads.
+
+Optionally unions older tables if present.
+
+Price data: via your technical_analyser.fetch_indicator_series()
+
+Respected through a local price cache (.cache/prices/) with TTL.
+
+Supports daily and intraday (e.g., 15m) series.
+
+yfinance_throttle.throttle_yfinance() is called to be a good citizen.
+
+Outputs (in ./portfolio/)
+
+backtest_trades.csv – all simulated fills and P&L.
+
+last_metrics.json – summary metrics (CAGR, Sharpe, PF, MaxDD, etc).
+
+GA artifacts (if --ga):
+
+ga_log.jsonl – per-generation logs (scores/metrics minimal schema).
+
+best_genes.json – best parameter set found.
+
+best_metrics.json – its metrics summary.
+
+Data model (what we read)
+Required DB tables/columns
+
+posts:
+
+posts(post_id TEXT PRIMARY KEY, platform TEXT, source TEXT, url TEXT, title TEXT, author TEXT,
+      scraped_at TEXT, posted_at TEXT, score REAL, text TEXT)
+
+
+stages (we read from here):
+
+stages(post_id TEXT, stage TEXT, created_at TEXT, payload JSON, PRIMARY KEY(post_id, stage))
+
+
+We select WHERE stage='chairman' AND payload IS NOT NULL AND TRIM(payload)<>''.
+
+Chairman JSON fields used
+
+From payload (preferred final_metrics.* path):
+
+Core: ticker, timeframe, implied_direction, direction_strength, conviction_0to100,
+risk_level, tradability_score_0to100, uncertainty_0to3, stale_risk_0to3.
+
+Technical: close, price_window_close_pct, rsi14, mfi, macd_line, macd_signal,
+macd_hist, trend_direction, trend_strength, trend_slope_pct_per_day,
+sma20/50/200, golden_cross, price_above_sma20/50/200,
+vol_ratio, vol_state, distance_to_support_pct, distance_to_resistance_pct.
+
+Sentiment: sentiment.des_raw, sentiment.conf.
+
+Context tags: catalysts[], watchouts[].
+
+(Optional) timestamps.* are used only if present; otherwise we fall back to stage timestamps.
+
+Important: You can choose whether to bound by article times or stage times (see “Date filters” below).
+
+TEMP VIEW
+
+chairman_flat_v3 flattens these fields for fast querying. It’s temporary—safe for read-only DBs.
+
+Date filters (what “Rows: N” means)
+
+The backtester loads rows using a date window. Two modes:
+
+Stage-bounded (default): uses stages.created_at (when the Chairman verdict was written).
+
+Article-bounded (recommended for production): uses posts.posted_at (when the article was published/scraped), if you pass --date-source article (see CLI).
+If your payload also carries timestamps.article_published_at etc., we can extend the VIEW to prefer those—easy to toggle.
+
+The “Rows: 81” message is just how many Chairman verdict rows fell inside your chosen window after filters (non-empty payload, has implied_direction, etc.). It is not the number of distinct tickers.
+
+Symbol resolution (ticker → Yahoo symbol)
+
+Tries enriched tickers from tickers/tickers_enriched.csv (if present).
+
+Falls back to suffix probes: ["", ".L", ".TO", ".V", ".PA", ...] to find a Yahoo symbol that actually returns data in the requested date range.
+
+Caches positive and negative resolutions during the run.
+
+You may see occasional skips like “Resolve failed: 'TotalEnergies'” if a verdict stores a company name instead of a ticker. That’s expected; you can improve this upstream (better ticker repair) or extend the alias map.
+
+Price intervals & “auto” logic
+
+--interval daily → load daily bars.
+
+--interval 15m (or --interval intraday) → load 15-minute bars (your fetch_indicator_series must support this).
+
+--interval auto (default smart mode):
+
+If window length ≤ --intraday-limit-days (default 59), we request 15-minute bars;
+
+Otherwise we request daily bars.
+This lets you flex between swing and intraday backtests without changing flags.
+
+Note: time_stop_days is bars, not calendar days. On 15m data, time_stop_days=15 means ~3h45m.
+
+Decisions – how trades are triggered
+Council gates (Chairman-aware)
+
+A row (verdict) must pass CouncilGates to become a buy/short signal. Key checks (long side):
+
+Directional: implied_direction == "up" (unless neutral mode is allowed), min_direction_strength, min_conviction.
+
+Risk/quality: uncertainty ≤ max, stale_risk ≤ max, tradability ≥ min, risk_level ∈ allow.
+
+Sentiment (optional gate): des_conf ≥ min, des_raw ≥ min.
+
+Technical: price_above_sma20/50 as required, trend_strength & trend_slope minima,
+RSI inside [min, max], MFI ≤ cap, MACD hist ≥ min,
+distance to resistance and support thresholds,
+vol_state ∈ allowed, vol_ratio ∈ [min, max].
+
+Pre-trade score adds: +catalyst bonuses (e.g., “regulatory approval”), −watchout penalties (e.g., “Nasdaq compliance”, “delisting”, “reverse split”), and MFI overbought penalty.
+You can require pretrade_score ≥ min_pretrade_score to enter.
+
+Legacy (soft) confirmations
+
+If you don’t use strict gates, there’s also a legacy “confirmations” path using RSI/MACD/SMA20+trend.
+
+Exits – how trades close
+
+The first condition to trigger wins:
+
+Hard exits
+
+Stop-loss: −8% (percent) or ATR*atr_multiple (ATR mode).
+
+Take-profit: +16% (percent) or symmetric ATR target.
+
+Trailing: 10% trail, updated bar-by-bar.
+
+Technical exits
+
+RSI exit: Longs at RSI≥70; Shorts at RSI≤30.
+
+MACD signal cross: Longs exit on cross-down; Shorts on cross-up.
+
+SMA20 regime flip: Longs exit if Close<SMA20; Shorts if Close>SMA20.
+
+Time stop
+
+Close after time_stop_days bars.
+
+Partial take-profit (optional)
+
+Book 50% at +10%, let the rest ride until another exit hits.
+
+All parameters are tunable (and GA-searchable).
+
+Backtest algorithm (overview)
+
+Build the TEMP VIEW.
+
+Query Chairman verdict rows in the chosen window (stage- or article-bounded).
+
+Group verdicts by ticker.
+
+Resolve the ticker → Yahoo symbol; load price history (from cache if available).
+
+For each verdict (by time):
+
+Evaluate Council gates and compute pre-trade score.
+
+If it passes, enter next bar’s Open (long/short).
+
+Simulate bar-by-bar until an exit fires.
+
+Apply slippage/fees. Update equity.
+
+Save trades CSV and compute metrics.
+
+Metrics & Fitness
+
+last_metrics.json includes:
+
+Trades, Total PnL, Win rate
+
+CAGR, Sharpe, Sortino
+
+Profit Factor, Max Drawdown, Calmar
+
+Realized Volatility, Expectancy
+
+mean_pretrade_score (Council consistency), watchout_hits share
+
+Fitness (for GA) blends:
+
+log-scaled CAGR and Profit Factor
+
+Sharpe, Sortino
+
+penalties for MaxDD / volatility
+
+rewards for consistency (pre-trade score) and sensible trade count
+
+Genetic Algorithm (GA) usage
+
+When --ga is set, the script:
+
+Samples a population of parameter sets from a large search space (60+ genes).
+
+For each generation:
+
+Scores every individual via a full backtest.
+
+Keeps elites, runs tournament selection, crossover, mutation.
+
+Logs progress to portfolio/ga_log.jsonl.
+
+Writes best_genes.json and best_metrics.json at the end.
+
+You can let it run “for hours”; it’s designed to grind. The price cache and per-symbol reuse keep it efficient.
+
+CLI reference
+usage: portfolio_probe.py --db PATH --start YYYY-MM-DD --end YYYY-MM-DD [options]
+
+Core:
+  --db PATH                 Path to wisdom_of_sheep.sql (read-only)
+  --start DATE              Inclusive start (e.g., 2025-09-20)
+  --end DATE                Inclusive end (e.g., 2025-10-21)
+  --date-source {stage,article}
+                           Date source for filtering rows:
+                           - stage (default): uses stages.created_at
+                           - article: join posts and use posts.posted_at
+  --ticker TICKER          Restrict to a single raw ticker symbol
+  --sql-filter SQL         Extra SQL WHERE clause for row filtering
+
+Price / interval:
+  --interval {auto,daily,15m,intraday}
+                           Bar interval; auto chooses 15m if window ≤ --intraday-limit-days, else daily
+  --intraday-limit-days N  Threshold (default 59)
+
+Verbosity / cache:
+  --verbose N              0=silent, 1=normal, 2=per-signal, 3=per-bar
+  --clear-price-cache      Wipe .cache/prices first
+
+Backtest params (non-GA defaults):
+  --stop-type {percent,atr}
+  --stop-loss-pct F        Default 0.08
+  --take-profit-pct F      Default 0.16
+  --trailing-stop-pct F    Default 0.10; negative to disable
+  --time-stop-bars N       Default 15 (bars!)
+  --atr-period N           Default 14
+  --atr-multiple F         Default 2.5
+  --risk-per-trade-pct F   Default 0.5
+  --slippage-bps F         Default 10
+  --fees-per-trade F       Default 0.0
+  --partial-at F           Default 0.10 (10%); set 0 to disable
+  --partial-size-pct F     Default 50
+  --one-per-ticker {0,1}   Default 1
+
+Council gates (quick overrides):
+  --need-implied-up {0,1}  Default 1
+  --min-dir-strength F     Default 1.0
+  --min-conviction F       Default 55
+  --max-uncertainty F      Default 2.5
+  --max-stale-risk F       Default 2.5
+  --min-tradability F      Default 45
+  --use-sentiment-gate {0,1}  Default 0
+  --min-des-conf F         Default 0.35
+  --min-des-raw F          Default -0.02
+  --require-above-sma20 {0,1}  Default 1
+  --require-above-sma50 {0,1}  Default 0
+  --allow-below-sma200 {0,1}   Default 1
+  --min-trend-strength F       Default 1.0
+  --min-trend-slope F          Default 0.5
+  --min-rsi F                  Default 52
+  --max-rsi F                  Default 78
+  --mfi-max-longs F            Default 82
+  --min-macd-hist-longs F      Default 0.0
+  --max-dist-to-res-pct F      Default 2.5
+  --min-dist-to-sup-pct F      Default 2.0
+  --vol-state                 Comma list, e.g. "calm,normal" (default)
+  --min-vol-ratio F            Default 0.6
+  --max-vol-ratio F            Default 1.8
+  --use-catalyst-bonus {0,1}   Default 1
+  --use-watchout-penalty {0,1} Default 1
+  --w-reg-approval F           Default 1.0
+  --w-overbought-penalty F     Default 0.7
+  --w-delisting F              Default 1.0
+  --min-pretrade-score F       Default 0.0
+
+GA:
+  --ga                        Enable GA search
+  --pop N                     Population size
+  --gens N                    Generations
+  --tournament-k N            Tournament size
+  --cx F                      Crossover rate (0..1)
+  --mut F                     Mutation rate (0..1)
+  --seed N                    RNG seed
+  --w-cagr F                  Fitness weight for CAGR
+  --w-sharpe F                Fitness weight for Sharpe
+  --w-sortino F               Fitness weight for Sortino
+  --w-pf F                    Fitness weight for Profit Factor
+  --w-win F                   Fitness weight for Win rate
+  --w-exp F                   Fitness weight for Expectancy
+  --w-maxdd F                 Fitness weight for MaxDD (negative to penalize)
+  --w-vol F                   Fitness weight for Volatility (negative to penalize)
+
+
+(Flags are illustrative; your current script exposes a representative subset via argparse. If you don’t see a flag, the same parameter is still GA-searchable and/or settable in code.)
+
+Examples
+1) Vanilla backtest, auto interval
+python portfolio_probe.py \
+  --db council/wisdom_of_sheep.sql \
+  --start 2025-09-25 --end 2025-10-22 \
+  --interval auto --intraday-limit-days 59 \
+  --verbose 1
+
+2) Article-date bounded, intraday
+python portfolio_probe.py \
+  --db council/wisdom_of_sheep.sql \
+  --start 2025-10-01 --end 2025-10-08 \
+  --date-source article \
+  --interval 15m \
+  --verbose 2
+
+3) GA sweep with a big search
+python portfolio_probe.py \
+  --db council/wisdom_of_sheep.sql \
+  --start 2025-09-25 --end 2025-10-22 \
+  --ga --pop 200 --gens 250 --tournament-k 7 --cx 0.9 --mut 0.25 \
+  --interval auto --intraday-limit-days 59 \
+  --verbose 1
+
+Performance tips
+
+Keep --interval auto + a sensible --intraday-limit-days to avoid accidental 15-minute runs across huge windows.
+
+The price cache speeds repeated runs and GA. Clear it with --clear-price-cache if needed.
+
+Use --ticker for focused debugging.
+
+Verbosity: --verbose 2 shows per-signal decisions; 3 shows per-bar simulation (slow but surgical).
+
+Troubleshooting
+
+“Resolve failed: 'X' → skip”
+The verdict used a name instead of a ticker (e.g., “TotalEnergies”). Improve upstream ticker repair, or extend _YF_ALIAS and tickers_enriched.csv.
+
+“Rows: N smaller than expected”
+
+Check date source. If you want article time, set --date-source article.
+
+Ensure Chairman payloads are in stages with non-empty payload.
+
+If your timestamps.* aren’t embedded in the payload, we won’t see them unless you join to posts (use --date-source article).
+
+No trades
+
+Gates too strict. Start with defaults; GA will “open the gates”.
+
+Interval too coarse/fine relative to signal cadence. Try --interval 15m for short timeframes.
+
+time_stop_days too small on intraday (remember: bars, not days).
+
+Extending
+
+Prefer article dates by default: swap the VIEW’s WHERE date(created_at) to a JOIN posts and filter by posts.posted_at.
+
+Add indicators: upstream in fetch_indicator_series; they become available for exits or gates.
+
+New catalysts/watchouts: extend tag matchers and add weights to GA search space.
+
+Requirements & env
+
+Python 3.10+
+
+pandas, numpy
+
+Your local technical_analyser.fetch_indicator_series and yfinance_throttle.throttle_yfinance
+
+Optional: yfinance
+
+Environment:
+
+WOS_VERBOSE – default verbosity (0–3)
+
+WOS_YF_THROTTLE_SECONDS – default 0.5
+
+WOS_PRICE_CACHE_DIR – default .cache/prices
+
+WOS_PRICE_CACHE_TTL_HOURS – default 24
+
+WOS_PRICE_CACHE_FMT – parquet (default) or pkl
+
+WOS_TICKERS_ENRICHED – path to enriched symbols CSV
+
+Quick mental model
+
+Verdicts in → Signals out: Chairman says “up, strength 2, conviction 70, good tradability”.
+
+Gates decide if we act, score shapes priority.
+
+Simulator enters next bar’s open and exits on stop/TP/trail/RSI/MACD/SMA/time.
+
+Metrics summarize; GA hunts for robust parameter sets.
