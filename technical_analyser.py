@@ -455,6 +455,63 @@ def tool_mfi_flow(ticker: str, period: int = 14) -> Dict[str, Any]:
     }
 
 
+# =========
+# Series API (for backtesters)
+# =========
+def compute_indicator_series_from_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Given a yfinance-style daily OHLCV DF (index = DatetimeIndex),
+    return a copy with columns: RSI14, MACD_LINE, MACD_SIGNAL, MACD_HIST, SMA20, SMA50, SMA200.
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    close = out["Close"].astype(float)
+
+    # SMAs
+    out["SMA20"]  = _sma(close, 20)
+    out["SMA50"]  = _sma(close, 50)
+    out["SMA200"] = _sma(close, 200)
+
+    # RSI14
+    out["RSI14"] = _rsi(close, 14)
+
+    # MACD (12,26,9)
+    m = _macd(close, 12, 26, 9)
+    out["MACD_LINE"]   = m["macd"]
+    out["MACD_SIGNAL"] = m["signal"]
+    out["MACD_HIST"]   = m["hist"]
+
+    return out
+
+
+def fetch_indicator_series(ticker: str, start: Optional[str] = None, end: Optional[str] = None,
+                           period_days: Optional[int] = None) -> pd.DataFrame:
+    """
+    Fetch OHLCV (1d) and attach indicator series.
+    If start/end provided → uses date window; else if period_days provided → uses period.
+    """
+    throttle_yfinance()
+    t = yf.Ticker(ticker)
+    if start and end:
+        df = t.history(start=_parse_date(start), end=_parse_date(end), interval="1d", auto_adjust=False, actions=False)
+    else:
+        period = f"{max(int(period_days or 90), 5)}d"
+        df = t.history(period=period, interval="1d", auto_adjust=False, actions=False)
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # Normalize to tz-aware UTC
+    if df.index.tz is None:
+        df.index = df.index.tz_localize(timezone.utc)
+    else:
+        df.index = df.index.tz_convert(timezone.utc)
+
+    return compute_indicator_series_from_df(df)
+
+
 # ===============
 # CLI & Harness
 # ===============
