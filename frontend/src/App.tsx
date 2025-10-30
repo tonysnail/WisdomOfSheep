@@ -258,10 +258,29 @@ export default function App() {
     window.localStorage.setItem(STORAGE_KEYS.selectedPost, pickedId)
   }, [pickedId])
 
-  const batchTotal = refreshJob?.total ?? 0
-  const batchDone = refreshJob?.done ?? 0
-  const progressPct = batchTotal ? Math.round((batchDone / batchTotal) * 100) : 0
-  const batchMsg = [refreshJob?.phase, refreshJob?.current].filter(Boolean).join(' – ') || refreshJob?.message || ''
+  const jobBatchTotal = Math.max(0, refreshJob?.total ?? 0)
+  const jobBatchDone = Math.max(0, refreshJob?.done ?? 0)
+  const baseBatchMsg =
+    [refreshJob?.phase, refreshJob?.current].filter(Boolean).join(' – ') || refreshJob?.message || ''
+
+  const oracleProgressTotalRaw = refreshJob?.oracle_progress_total ?? null
+  const oracleProgressIndexRaw = refreshJob?.oracle_progress_index ?? null
+  const oracleProgressStageRaw = (refreshJob?.oracle_progress_stage ?? '').trim()
+  const oracleProgressMessage = (refreshJob?.oracle_progress_message ?? '').trim()
+  const oracleStageKey = oracleProgressStageRaw.toLowerCase()
+  const oracleProgressTotal = Math.max(0, Math.trunc(oracleProgressTotalRaw ?? 0))
+  const oracleProgressDone = Math.max(
+    0,
+    Math.min(oracleProgressTotal, Math.trunc(oracleProgressIndexRaw ?? 0)),
+  )
+  const showOracleProgress =
+    ['warmup', 'backlog', 'live'].includes(oracleStageKey) && oracleProgressTotal > 0
+
+  const progressTotal = showOracleProgress ? oracleProgressTotal : jobBatchTotal
+  const progressDone = showOracleProgress ? oracleProgressDone : jobBatchDone
+  const progressPct =
+    progressTotal > 0 ? Math.round((Math.min(progressDone, progressTotal) / progressTotal) * 100) : 0
+  const progressMsg = (showOracleProgress ? oracleProgressMessage : baseBatchMsg) || ''
   const jobActive = refreshJob ? refreshJob.status === 'queued' || refreshJob.status === 'running' : Boolean(refreshJobId)
   const working = busy || jobBusy
   const councilTotal = councilProgress?.stages.length ?? 0
@@ -1523,13 +1542,15 @@ export default function App() {
 
       <div className="toolbar">
         <div className="toolbar-row toolbar-primary">
-          <div className="progress" title={`${batchDone}/${batchTotal}`}>
+          <div className="progress" title={progressTotal > 0 ? `${progressDone}/${progressTotal}` : undefined}>
             <div style={{ width: `${progressPct}%` }} />
           </div>
-          {batchTotal > 0 && <div className="muted small">{batchDone}/{batchTotal}</div>}
-          {batchMsg && (
+          {progressTotal > 0 && (
+            <div className="muted small">{progressDone}/{progressTotal}</div>
+          )}
+          {progressMsg && (
             <div className="muted small" style={{ marginLeft: 8 }}>
-              {batchMsg}
+              {progressMsg}
             </div>
           )}
           {logSnippet && (
