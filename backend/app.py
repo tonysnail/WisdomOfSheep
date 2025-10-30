@@ -74,6 +74,32 @@ except Exception as exc:  # noqa: BLE001
     compute_interest_for_post = None  # type: ignore[assignment]
     INTEREST_SCORE_IMPORT_ERROR = exc
 
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float | None) -> Optional[float]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return value
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() not in {"", "0", "false", "no"}
+
+
 # =========================
 # Config (env-overridable)
 # =========================
@@ -105,10 +131,6 @@ ORACLE_BACKOFF_MIN = 2.0 if _ORACLE_BACKOFF_MIN_RAW is None else max(0.5, _ORACL
 _ORACLE_BACKOFF_MAX_RAW = _env_float("WOS_ORACLE_BACKOFF_MAX_SECONDS", 30.0)
 ORACLE_BACKOFF_MAX = 30.0 if _ORACLE_BACKOFF_MAX_RAW is None else max(ORACLE_BACKOFF_MIN, _ORACLE_BACKOFF_MAX_RAW)
 ORACLE_REQUEST_TIMEOUT = _env_float("WOS_ORACLE_TIMEOUT_SECONDS", 30.0)
-
-
-def _env_flag(name: str, default: str = "0") -> bool:
-    return os.getenv(name, default).strip().lower() not in {"", "0", "false", "no"}
 
 
 def _handle_wal_files(base_path: Path, dest_base: Path | None) -> None:
@@ -195,28 +217,6 @@ def _ensure_database_ready() -> None:
             _initialize_db_file(current)
 
         _DB_READY_PATH = current
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_float(name: str, default: float | None) -> Optional[float]:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return default
-    return value
-
 
 PAGE_SIZE_DEFAULT = _env_int("WOS_PAGE_SIZE", 50)
 BATCH_LIMIT = _env_int("WOS_BATCH_LIMIT", 200)
