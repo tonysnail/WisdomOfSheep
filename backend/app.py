@@ -32,6 +32,9 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+COUNCIL_FAILURE_LOG = ROOT / "council_failures.log"
+COUNCIL_FAILURE_LOG_LOCK = threading.Lock()
+
 from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -116,6 +119,8 @@ DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 ORACLE_CURSOR_PATH = DATA_DIR / "oracle_cursor.json"
+ORACLE_RETRY_STATE_PATH = DATA_DIR / "oracle_retry_state.json"
+ORACLE_SKIPPED_PATH = DATA_DIR / "skipped_articles.json"
 ORACLE_DEFAULT_BASE_URL = (os.getenv("WOS_ORACLE_BASE_URL", "") or "").strip()
 ORACLE_USER = os.getenv("WOS_ORACLE_USER", "")
 ORACLE_PASS = os.getenv("WOS_ORACLE_PASS", "")
@@ -131,6 +136,7 @@ ORACLE_BACKOFF_MIN = 2.0 if _ORACLE_BACKOFF_MIN_RAW is None else max(0.5, _ORACL
 _ORACLE_BACKOFF_MAX_RAW = _env_float("WOS_ORACLE_BACKOFF_MAX_SECONDS", 30.0)
 ORACLE_BACKOFF_MAX = 30.0 if _ORACLE_BACKOFF_MAX_RAW is None else max(ORACLE_BACKOFF_MIN, _ORACLE_BACKOFF_MAX_RAW)
 ORACLE_REQUEST_TIMEOUT = _env_float("WOS_ORACLE_TIMEOUT_SECONDS", 30.0)
+ORACLE_MAX_RETRIES = max(0, _env_int("WOS_ORACLE_MAX_RETRIES", 3))
 
 
 def _handle_wal_files(base_path: Path, dest_base: Path | None) -> None:
@@ -1814,6 +1820,30 @@ class _CallbackWriter(io.TextIOBase):
         self._buffer = ""
 
 
+def _record_council_failure(
+    stage: str,
+    post_id: str,
+    title: str,
+    details: str,
+    *,
+    context: Optional[str] = None,
+) -> None:
+    safe_details = (details or "").replace("\n", " ").strip()
+    entry = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "stage": stage,
+        "post_id": post_id,
+        "title": title,
+        "details": safe_details,
+    }
+    if context:
+        entry["context"] = context
+    with COUNCIL_FAILURE_LOG_LOCK:
+        COUNCIL_FAILURE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with COUNCIL_FAILURE_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
 # =========================
 # Job helpers
 # =========================
@@ -1908,6 +1938,77 @@ def _save_oracle_cursor(cursor: Dict[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp_path, ORACLE_CURSOR_PATH)
+
+
+def _default_oracle_retry_state() -> Dict[str, Any]:
+    return {
+        "post_id": "",
+        "attempts": 0,
+        "scraped_at": "",
+        "platform": "",
+        "source": "",
+        "title": "",
+        "last_error": "",
+    }
+
+
+def _load_oracle_retry_state() -> Dict[str, Any]:
+    if not ORACLE_RETRY_STATE_PATH.exists():
+        return _default_oracle_retry_state()
+    try:
+        raw = json.loads(ORACLE_RETRY_STATE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return _default_oracle_retry_state()
+        state = _default_oracle_retry_state()
+        for key in state:
+            if key in raw:
+                state[key] = str(raw[key] or "") if isinstance(state[key], str) else raw[key]
+        attempts = raw.get("attempts")
+        try:
+            state["attempts"] = int(attempts) if attempts is not None else 0
+        except (TypeError, ValueError):
+            state["attempts"] = 0
+        return state
+    except Exception:
+        return _default_oracle_retry_state()
+
+
+def _save_oracle_retry_state(state: Dict[str, Any]) -> None:
+    payload = {
+        "post_id": str(state.get("post_id", "") or ""),
+        "attempts": int(state.get("attempts", 0) or 0),
+        "scraped_at": str(state.get("scraped_at", "") or ""),
+        "platform": str(state.get("platform", "") or ""),
+        "source": str(state.get("source", "") or ""),
+        "title": str(state.get("title", "") or ""),
+        "last_error": str(state.get("last_error", "") or ""),
+    }
+    tmp_path = ORACLE_RETRY_STATE_PATH.with_suffix(".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, ORACLE_RETRY_STATE_PATH)
+
+
+def _append_skipped_article_entry(entry: Dict[str, Any], keep: int = 200) -> None:
+    existing: List[Dict[str, Any]] = []
+    if ORACLE_SKIPPED_PATH.exists():
+        try:
+            raw = json.loads(ORACLE_SKIPPED_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                existing = [item for item in raw if isinstance(item, dict)]
+        except Exception:
+            existing = []
+    existing.append(entry)
+    if keep > 0 and len(existing) > keep:
+        existing = existing[-keep:]
+    tmp_path = ORACLE_SKIPPED_PATH.with_suffix(".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(existing, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, ORACLE_SKIPPED_PATH)
 
 
 def _oracle_auth_tuple() -> Optional[Tuple[str, str]]:
@@ -2246,6 +2347,15 @@ def _worker_refresh_summaries(job_id: str):
         pending_article: Optional[Dict[str, Any]] = None
         ref_platform: Optional[str] = None
         ref_post_id: Optional[str] = None
+        retry_state = _load_oracle_retry_state()
+
+        def _set_retry_state(state: Dict[str, Any]) -> None:
+            nonlocal retry_state
+            retry_state = state
+            _save_oracle_retry_state(state)
+
+        def _clear_retry_state() -> None:
+            _set_retry_state(_default_oracle_retry_state())
 
         while _ensure_not_cancelled():
             batch = _fetch_batch(ref_platform, ref_post_id, ORACLE_BATCH_SIZE)
@@ -2331,7 +2441,7 @@ def _worker_refresh_summaries(job_id: str):
                         f"No new articles on Oracle ({last_desc}). Polling again in {wait:.1f}s…",
                     )
                     time.sleep(wait)
-                    poll_interval = min(wait * 1.5, ORACLE_POLL_MAX)
+                    poll_interval = ORACLE_POLL_BASE
                     continue
                 pending_article = batch[0]
                 idle_started = None
@@ -2344,6 +2454,19 @@ def _worker_refresh_summaries(job_id: str):
             platform = details["platform"]
             source = details["source"]
             display_title = title[:80]
+
+            if retry_state.get("post_id") != pid:
+                _set_retry_state(
+                    {
+                        "post_id": pid,
+                        "attempts": 0,
+                        "scraped_at": scraped_at,
+                        "platform": platform,
+                        "source": source,
+                        "title": title,
+                        "last_error": "",
+                    }
+                )
 
             _job_update_fields(
                 job_id,
@@ -2386,17 +2509,83 @@ def _worker_refresh_summaries(job_id: str):
             if only_new:
                 existing_posts.add(pid)
 
-            code = 0
-            while _ensure_not_cancelled():
-                code = _stream_summariser(pid, title)
-                if code == 0:
-                    break
-                _job_append_log(job_id, f"✗ summariser exit {code} for {pid}; retrying in 5s")
-                time.sleep(5)
-            if code != 0:
+            success, error_text, log_lines = _stream_summariser(pid, title)
+            if not success:
+                reason = error_text or (log_lines[-1] if log_lines else "Unknown summariser failure")
+                reason = str(reason or "")
+                log_tail = "; ".join(log_lines[-5:]) if log_lines else ""
+                attempts = int(retry_state.get("attempts", 0) or 0) + 1
+                _set_retry_state(
+                    {
+                        "post_id": pid,
+                        "attempts": attempts,
+                        "scraped_at": scraped_at,
+                        "platform": platform,
+                        "source": source,
+                        "title": title,
+                        "last_error": reason,
+                    }
+                )
+
+                if attempts < ORACLE_MAX_RETRIES:
+                    retry_message = (
+                        f"⚠ summariser retry {scraped_at} {platform}:{pid} "
+                        f"attempt {attempts}/{ORACLE_MAX_RETRIES}: {reason}"
+                    )
+                    if log_tail:
+                        retry_message += f" | log_tail={log_tail}"
+                    _job_append_log(job_id, retry_message)
+                    time.sleep(min(ORACLE_BACKOFF_MIN, 5.0))
+                    continue
+
+                skip_message = (
+                    f"✗ summariser skipped {scraped_at} {platform}:{pid} after {attempts} attempts"
+                )
+                if reason:
+                    skip_message += f": {reason}"
+                _job_append_log(job_id, skip_message)
+                _record_council_failure(
+                    "summariser",
+                    pid,
+                    title,
+                    f"{reason}" if not log_tail else f"{reason} | log_tail={log_tail}",
+                    context=(
+                        f"scraped_at={scraped_at}, platform={platform}, source={source}, "
+                        f"display_title={display_title}, attempts={attempts}"
+                    ),
+                )
+                _append_skipped_article_entry(
+                    {
+                        "post_id": pid,
+                        "scraped_at": scraped_at,
+                        "platform": platform,
+                        "source": source,
+                        "title": title,
+                        "attempts": attempts,
+                        "reason": reason,
+                        "skipped_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    }
+                )
+                _clear_retry_state()
+                _job_increment(job_id, "done", 1)
+                cursor_state = {
+                    "platform": platform,
+                    "post_id": pid,
+                    "scraped_at": scraped_at,
+                }
+                _save_oracle_cursor(cursor_state)
+                _job_update_fields(
+                    job_id,
+                    oracle_cursor=cursor_state,
+                    oracle_poll_seconds=None,
+                    oracle_idle_since=None,
+                )
+                ref_platform = platform or None
+                ref_post_id = pid or None
                 pending_article = None
                 continue
 
+            _clear_retry_state()
             summarised.add(pid)
             _job_append_log(
                 job_id,
@@ -2510,9 +2699,13 @@ def _worker_refresh_summaries(job_id: str):
             _run_interest_for_post(pid, title)
             _interest_after_run()
 
-    def _stream_summariser(post_id: str, title: str) -> int:
+    def _stream_summariser(post_id: str, title: str) -> Tuple[bool, Optional[str], List[str]]:
+        log_lines: List[str] = []
+
         def emit(line: str) -> None:
-            _job_append_log(job_id, line.rstrip("\r"))
+            clean_line = line.rstrip("\r")
+            log_lines.append(clean_line)
+            _job_append_log(job_id, clean_line)
 
         writer = _CallbackWriter(emit)
         try:
@@ -2531,11 +2724,12 @@ def _worker_refresh_summaries(job_id: str):
         except Exception as exc:
             writer.flush()
             logging.exception("summariser stage failed for %s", post_id)
-            emit(f"✗ summariser failed {post_id}: {exc}")
-            return 1
+            message = str(exc)
+            emit(f"✗ summariser failed {post_id}: {message}")
+            return False, message, log_lines
 
         writer.flush()
-        return 0
+        return True, None, log_lines
 
     try:
         try:
@@ -2589,8 +2783,8 @@ def _worker_refresh_summaries(job_id: str):
 
             _job_append_log(job_id, f"→ backlog summarising {pid}")
 
-            code = _stream_summariser(pid, title)
-            if code == 0:
+            success, error_text, log_lines = _stream_summariser(pid, title)
+            if success:
                 summarised.add(pid)
                 _job_append_log(job_id, f"✓ summarised backlog {pid}")
                 try:
@@ -2614,7 +2808,19 @@ def _worker_refresh_summaries(job_id: str):
                     logging.exception("interest scoring check failed for backlog %s", pid)
                     _job_append_log(job_id, f"⚠ interest backlog check failed {pid}: {exc}")
             else:
-                _job_append_log(job_id, f"✗ summariser exit {code} for backlog {pid}")
+                reason = error_text or (log_lines[-1] if log_lines else "Unknown summariser failure")
+                log_tail = "; ".join(log_lines[-5:]) if log_lines else ""
+                _job_append_log(job_id, f"✗ summariser failed backlog {pid}; skipping")
+                _record_council_failure(
+                    "summariser",
+                    pid,
+                    title,
+                    f"{reason}" if not log_tail else f"{reason} | log_tail={log_tail}",
+                    context=(
+                        f"backlog_index={index}/{backlog_total}, remaining={remaining_backlog}, "
+                        f"display_title={display_title}"
+                    ),
+                )
 
             _job_increment(job_id, "done", 1)
 
@@ -2701,8 +2907,8 @@ def _worker_refresh_summaries(job_id: str):
                     )
                     _job_append_log(job_id, f"→ summarising {pid}")
 
-                    code = _stream_summariser(pid, title)
-                    if code == 0:
+                    success, error_text, log_lines = _stream_summariser(pid, title)
+                    if success:
                         summarised.add(pid)
                         _job_append_log(job_id, f"✓ summarised {pid}")
                         try:
@@ -2733,7 +2939,19 @@ def _worker_refresh_summaries(job_id: str):
                                 interest_score_val = None
                         _record_new_post(pid, title, interest_score_val)
                     else:
-                        _job_append_log(job_id, f"✗ summariser exit {code} for {pid}")
+                        reason = error_text or (log_lines[-1] if log_lines else "Unknown summariser failure")
+                        log_tail = "; ".join(log_lines[-5:]) if log_lines else ""
+                        _job_append_log(job_id, f"✗ summariser failed {pid}; skipping")
+                        _record_council_failure(
+                            "summariser",
+                            pid,
+                            title,
+                            f"{reason}" if not log_tail else f"{reason} | log_tail={log_tail}",
+                            context=(
+                                f"csv_index={csv_processed}/{csv_total}, remaining={remaining_csv}, "
+                                f"display_title={display_title}"
+                            ),
+                        )
 
                     _job_increment(job_id, "done", 1)
 
