@@ -2267,6 +2267,20 @@ def _worker_refresh_summaries(job_id: str):
             )
             return
 
+        def _reserve_progress_slots(min_remaining: int = 2) -> None:
+            slack = max(int(min_remaining), 2)
+
+            def mutate(job: Dict[str, Any]) -> None:
+                done = int(job.get("done", 0) or 0)
+                total = int(job.get("total", 0) or 0)
+                desired = done + slack
+                if desired > total:
+                    job["total"] = desired
+
+            _job_mutate(job_id, mutate)
+
+        _reserve_progress_slots()
+
         session = requests.Session()
         auth_tuple = _oracle_auth_tuple()
         if auth_tuple:
@@ -2675,6 +2689,8 @@ def _worker_refresh_summaries(job_id: str):
         _write_warmup_snapshot(force=True)
 
         warmup_total = len(warmup_queue)
+        if warmup_total:
+            _reserve_progress_slots(warmup_total + 1)
         warmup_summary_msg = (
             f"Warm-up queued {warmup_total} unsummarised article(s)"
             if warmup_total
@@ -2717,6 +2733,7 @@ def _worker_refresh_summaries(job_id: str):
                     pending_progress_total = max(warmup_total, 1)
                     pending_progress_index = backlog_processed
                     idle_started = None
+                    _reserve_progress_slots(len(warmup_queue) + 2)
                 else:
                     stats_total = 0
                     stats_resp = _request("/wos/stats", min_interval=1.0)
@@ -2780,6 +2797,7 @@ def _worker_refresh_summaries(job_id: str):
                     pending_progress_index = next_index
                     idle_started = None
                     poll_interval = ORACLE_POLL_BASE
+                    _reserve_progress_slots()
 
             details = _normalize_article(pending_article)
             pid = details["post_id"]
