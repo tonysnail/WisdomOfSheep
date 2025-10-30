@@ -2573,6 +2573,34 @@ def _worker_refresh_summaries(job_id: str):
         scanned_count = 0
         last_seen_article: Optional[Dict[str, Any]] = None
         warmup_finished = False
+        warmup_snapshot_count = -1
+
+        def _write_warmup_snapshot(force: bool = False) -> None:
+            nonlocal warmup_snapshot_count
+            if not force and len(warmup_records) == warmup_snapshot_count:
+                return
+            try:
+                _save_oracle_unsummarised(warmup_records, cutoff_iso=warmup_cutoff_iso)
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("failed to update Oracle backlog snapshot")
+                _job_append_log(job_id, f"⚠ failed to update Oracle backlog snapshot: {exc}")
+            else:
+                warmup_snapshot_count = len(warmup_records)
+
+        def _mark_backlog_processed(post_id: str) -> None:
+            nonlocal warmup_records
+            safe_pid = (post_id or "").strip()
+            if not safe_pid or not warmup_records:
+                return
+            filtered = [
+                entry
+                for entry in warmup_records
+                if (entry.get("post_id") or "").strip() != safe_pid
+            ]
+            if len(filtered) == len(warmup_records):
+                return
+            warmup_records = filtered
+            _write_warmup_snapshot()
 
         stats_resp = _request("/wos/stats", min_interval=0.2)
         if stats_resp is not None and stats_resp.ok:
@@ -2643,9 +2671,8 @@ def _worker_refresh_summaries(job_id: str):
 
         if warmup_queue:
             warmup_queue.sort(key=_sort_by_scraped)
-        if warmup_records:
-            warmup_records.sort(key=_sort_by_scraped)
-            _save_oracle_unsummarised(warmup_records, cutoff_iso=warmup_cutoff_iso)
+        warmup_records.sort(key=_sort_by_scraped)
+        _write_warmup_snapshot(force=True)
 
         warmup_total = len(warmup_queue)
         warmup_summary_msg = (
@@ -2809,6 +2836,8 @@ def _worker_refresh_summaries(job_id: str):
                     f"↷ {log_prefix} skipping known failure {scraped_at} {platform}:{pid} — {display_title}"
                 )
                 _job_append_log(job_id, skip_message)
+                if pending_stage == "backlog":
+                    _mark_backlog_processed(pid)
                 cursor_state = {
                     "platform": platform,
                     "post_id": pid,
@@ -2920,6 +2949,8 @@ def _worker_refresh_summaries(job_id: str):
                 )
                 _clear_retry_state()
                 _job_increment(job_id, "done", 1)
+                if pending_stage == "backlog":
+                    _mark_backlog_processed(pid)
                 cursor_state = {
                     "platform": platform,
                     "post_id": pid,
@@ -2984,6 +3015,8 @@ def _worker_refresh_summaries(job_id: str):
                 _run_oracle_council(pid, title, interest_score_val)
 
             _job_increment(job_id, "done", 1)
+            if pending_stage == "backlog":
+                _mark_backlog_processed(pid)
 
             cursor_state = {
                 "platform": platform,
