@@ -32,8 +32,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-COUNCIL_FAILURE_LOG = ROOT / "council_failures.log"
-COUNCIL_FAILURE_LOG_LOCK = threading.Lock()
+COUNCIL_FAILURES_PATH = ROOT / "council_failures.json"
+COUNCIL_FAILURES_LOCK = threading.Lock()
 
 from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -1820,6 +1820,44 @@ class _CallbackWriter(io.TextIOBase):
         self._buffer = ""
 
 
+def _load_council_failure_entries() -> List[Dict[str, Any]]:
+    if not COUNCIL_FAILURES_PATH.exists():
+        return []
+    try:
+        with COUNCIL_FAILURES_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        data = data.get("failures")
+    if not isinstance(data, list):
+        return []
+    entries: List[Dict[str, Any]] = []
+    for item in data:
+        if isinstance(item, dict):
+            entries.append(item)
+    return entries
+
+
+def _save_council_failure_entries(entries: List[Dict[str, Any]]) -> None:
+    COUNCIL_FAILURES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = COUNCIL_FAILURES_PATH.with_suffix(".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(entries, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, COUNCIL_FAILURES_PATH)
+
+
+def _load_failed_post_ids() -> Set[str]:
+    failed_ids: Set[str] = set()
+    for entry in _load_council_failure_entries():
+        pid = str(entry.get("post_id") or "").strip()
+        if pid:
+            failed_ids.add(pid)
+    return failed_ids
+
+
 def _record_council_failure(
     stage: str,
     post_id: str,
@@ -1838,10 +1876,10 @@ def _record_council_failure(
     }
     if context:
         entry["context"] = context
-    with COUNCIL_FAILURE_LOG_LOCK:
-        COUNCIL_FAILURE_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with COUNCIL_FAILURE_LOG.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    with COUNCIL_FAILURES_LOCK:
+        entries = _load_council_failure_entries()
+        entries.append(entry)
+        _save_council_failure_entries(entries)
 
 
 # =========================
@@ -2348,6 +2386,7 @@ def _worker_refresh_summaries(job_id: str):
         ref_platform: Optional[str] = None
         ref_post_id: Optional[str] = None
         retry_state = _load_oracle_retry_state()
+        failed_post_ids = _load_failed_post_ids()
 
         def _set_retry_state(state: Dict[str, Any]) -> None:
             nonlocal retry_state
@@ -2370,6 +2409,21 @@ def _worker_refresh_summaries(job_id: str):
                 if pid in summarised:
                     last_processed = article
                     ref_platform = str(article.get("platform") or "") or None
+                    ref_post_id = pid
+                    continue
+                if pid in failed_post_ids:
+                    platform_txt = str(article.get("platform") or "")
+                    scraped_txt = str(article.get("scraped_at") or "")
+                    title_txt = str(article.get("title") or "")
+                    _job_append_log(
+                        job_id,
+                        (
+                            f"↷ oracle skipping known failure {scraped_txt} "
+                            f"{platform_txt}:{pid} — {title_txt[:80]}"
+                        ).strip(),
+                    )
+                    last_processed = article
+                    ref_platform = platform_txt or None
                     ref_post_id = pid
                     continue
                 pending_article = article
@@ -2481,6 +2535,33 @@ def _worker_refresh_summaries(job_id: str):
                 f"→ oracle summarising {scraped_at} {platform}:{pid} — {display_title}",
             )
 
+            if pid in failed_post_ids:
+                skip_message = (
+                    f"↷ oracle skipping known failure {scraped_at} {platform}:{pid} — {display_title}"
+                )
+                _job_append_log(job_id, skip_message)
+                cursor_state = {
+                    "platform": platform,
+                    "post_id": pid,
+                    "scraped_at": scraped_at,
+                }
+                _save_oracle_cursor(cursor_state)
+                _job_update_fields(
+                    job_id,
+                    oracle_status="processing",
+                    phase="Oracle skipping known failure",
+                    current=f"{scraped_at} {platform}:{pid} — skipped",
+                    oracle_cursor=cursor_state,
+                    oracle_poll_seconds=None,
+                    oracle_idle_since=None,
+                )
+                _job_increment(job_id, "done", 1)
+                _clear_retry_state()
+                ref_platform = platform or None
+                ref_post_id = pid or None
+                pending_article = None
+                continue
+
             post_vals = {
                 "post_id": pid,
                 "platform": platform or None,
@@ -2554,6 +2635,7 @@ def _worker_refresh_summaries(job_id: str):
                         f"display_title={display_title}, attempts={attempts}"
                     ),
                 )
+                failed_post_ids.add(pid)
                 _append_skipped_article_entry(
                     {
                         "post_id": pid,
