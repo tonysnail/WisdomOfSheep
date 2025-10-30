@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   listPosts,
   getPost,
@@ -37,8 +37,10 @@ const COUNCIL_STAGE_LABELS: Record<string, string> = {
 
 const ORACLE_STATUS_MAX_LENGTH = 'Oracle: Processing (last 2025-10-12T20:00:27+00:00 reddit:t3_1o4y3sa)'.length
 
-const truncateOracleStatus = (text: string): string => {
-  if (text.length <= ORACLE_STATUS_MAX_LENGTH) return text
+function truncateOracleStatus(text: string): string {
+  if (text.length <= ORACLE_STATUS_MAX_LENGTH) {
+    return text
+  }
   return `${text.slice(0, ORACLE_STATUS_MAX_LENGTH - 1)}…`
 }
 
@@ -367,7 +369,7 @@ export default function App() {
       default:
         return truncateOracleStatus('Oracle: Offline')
     }
-  }, [oracleStatus, oracleIdleInfo, oracleCursor, truncateOracleStatus])
+  }, [oracleStatus, oracleIdleInfo, oracleCursor])
 
   const deriveLogSnippet = (value: string): string => {
     const trimmed = value.trim()
