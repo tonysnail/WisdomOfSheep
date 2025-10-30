@@ -170,6 +170,8 @@ export type RefreshSummariesMode = 'full' | 'new_only'
 export async function startRefreshSummaries(options?: {
   mode?: RefreshSummariesMode
   collectNewPosts?: boolean
+  oracleOnline?: boolean
+  oracleBaseUrl?: string
 }): Promise<{
   ok: boolean
   job_id: string
@@ -180,6 +182,12 @@ export async function startRefreshSummaries(options?: {
   if (options?.mode) payload.mode = options.mode
   if (typeof options?.collectNewPosts === 'boolean') {
     payload.collect_new_posts = options.collectNewPosts
+  }
+  if (typeof options?.oracleOnline === 'boolean') {
+    payload.oracle_online = options.oracleOnline
+  }
+  if (options?.oracleBaseUrl) {
+    payload.oracle_base_url = options.oracleBaseUrl
   }
   const body = Object.keys(payload).length > 0 ? JSON.stringify(payload) : null
   const headers = body ? { 'Content-Type': 'application/json' } : undefined
@@ -227,6 +235,16 @@ export type RefreshJob = {
     title?: string | null
     interest_score?: number | null
   }[]
+  oracle_online?: boolean
+  oracle_base_url?: string | null
+  oracle_status?: string | null
+  oracle_cursor?: {
+    platform?: string | null
+    post_id?: string | null
+    scraped_at?: string | null
+  } | null
+  oracle_poll_seconds?: number | null
+  oracle_idle_since?: number | null
 }
 
 export async function getRefreshJob(jobId: string): Promise<RefreshJob> {

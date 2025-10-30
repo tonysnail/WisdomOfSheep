@@ -50,6 +50,22 @@ const parseInterestScore = (value: unknown): number | null => {
   return null
 }
 
+const normalizeOracleStatusValue = (value: unknown): OracleStatus => {
+  const allowed: OracleStatus[] = [
+    'offline',
+    'connecting',
+    'warmup',
+    'processing',
+    'idle',
+    'error',
+    'unauthorized',
+  ]
+  if (typeof value === 'string' && allowed.includes(value as OracleStatus)) {
+    return value as OracleStatus
+  }
+  return 'offline'
+}
+
 const STORAGE_KEYS = {
   selectedDate: 'wos.selectedDate',
   selectedPost: 'wos.selectedPostId',
@@ -59,6 +75,8 @@ const STORAGE_KEYS = {
   councilPrimed: 'wos.councilPrimedMissing',
   analyseNewActive: 'wos.analyseNewActive',
   analyseNewThreshold: 'wos.analyseNewThreshold',
+  oracleOnline: 'wos.oracleOnline',
+  oracleBaseUrl: 'wos.oracleBaseUrl',
 } as const
 
 type CouncilProgressState = {
@@ -66,6 +84,15 @@ type CouncilProgressState = {
   currentStageIndex: number
   completed: number
 }
+
+type OracleStatus =
+  | 'offline'
+  | 'connecting'
+  | 'warmup'
+  | 'processing'
+  | 'idle'
+  | 'error'
+  | 'unauthorized'
 
 export default function App() {
   const [q, setQ] = useState('')
@@ -84,6 +111,19 @@ export default function App() {
     const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN
     return Number.isFinite(parsed) && parsed >= 0 && parsed <= 100 ? parsed : 0
   })
+
+  const [oracleOnline, setOracleOnline] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false
+    return window.localStorage.getItem(STORAGE_KEYS.oracleOnline) === '1'
+  })
+  const [oracleBaseUrl, setOracleBaseUrl] = useState<string>(() => {
+    if (typeof window === 'undefined') return ''
+    return window.localStorage.getItem(STORAGE_KEYS.oracleBaseUrl) ?? ''
+  })
+  const [oracleStatus, setOracleStatus] = useState<OracleStatus>('offline')
+  const [oracleBanner, setOracleBanner] = useState<string | null>(null)
+  const [oracleIdleInfo, setOracleIdleInfo] = useState<{ pollSeconds?: number | null; idleSince?: number | null } | null>(null)
+  const [oracleCursor, setOracleCursor] = useState<{ platform?: string | null; post_id?: string | null; scraped_at?: string | null } | null>(null)
 
   const [selectedDate, setSelectedDate] = useState<Date | null>(() => {
     if (typeof window === 'undefined') return null
@@ -179,6 +219,12 @@ export default function App() {
     setAnalyseNewCouncilStarted(false)
     setAnalyseNewRefreshComplete(false)
     setAnalyseNewHadEligible(false)
+    setOracleIdleInfo(null)
+    setOracleCursor(null)
+    setOracleBanner((prev) =>
+      prev === 'Oracle auth invalid. Set WOS_ORACLE_USER and WOS_ORACLE_PASS.' ? prev : null,
+    )
+    setOracleStatus((prev) => (prev === 'unauthorized' ? prev : 'offline'))
   }, [clearAnalyseNewQueues])
 
   useEffect(() => {
@@ -271,6 +317,63 @@ export default function App() {
     .pop() || ''
   const councilDisplayLog = (councilLogEntry || councilJobMessage || councilLastLine).trim()
   const panelDisabled = busy || jobBusy || councilJobBusy || analyseNewActive
+  const oracleControlsDisabled = working || jobActive || councilJobActive || councilJobBusy || analyseNewActive
+  const oracleStatusVariant = useMemo(() => {
+    switch (oracleStatus) {
+      case 'processing':
+        return 'positive'
+      case 'idle':
+      case 'warmup':
+      case 'connecting':
+        return 'warning'
+      case 'unauthorized':
+      case 'error':
+        return 'negative'
+      default:
+        return 'neutral'
+    }
+  }, [oracleStatus])
+  const oracleStatusText = useMemo(() => {
+    const cursorBits: string[] = []
+    if (oracleCursor) {
+      const parts: string[] = []
+      if (oracleCursor.scraped_at) parts.push(String(oracleCursor.scraped_at))
+      const idPart = [oracleCursor.platform, oracleCursor.post_id].filter(Boolean).join(':')
+      if (idPart) parts.push(idPart)
+      if (parts.length > 0) {
+        cursorBits.push(`last ${parts.join(' ')}`.trim())
+      }
+    }
+    switch (oracleStatus) {
+      case 'connecting':
+        return 'Oracle: Connecting…'
+      case 'warmup':
+        return 'Oracle: Warm-up scan…'
+      case 'processing':
+        return cursorBits.length > 0
+          ? `Oracle: Processing (${cursorBits.join(' · ')})`
+          : 'Oracle: Processing…'
+      case 'idle': {
+        const pollText =
+          oracleIdleInfo?.pollSeconds != null
+            ? `${oracleIdleInfo.pollSeconds.toFixed(1)}s`
+            : '?s'
+        let idleSegment = ''
+        if (oracleIdleInfo?.idleSince != null) {
+          const elapsed = Math.max(0, Date.now() / 1000 - oracleIdleInfo.idleSince)
+          idleSegment = ` • Idle for ${formatEta(elapsed)}`
+        }
+        const cursorSegment = cursorBits.length > 0 ? ` • ${cursorBits.join(' · ')}` : ''
+        return `Oracle: Idle (poll ${pollText})${idleSegment}${cursorSegment}`
+      }
+      case 'unauthorized':
+        return 'Oracle: Unauthorized'
+      case 'error':
+        return 'Oracle: Error'
+      default:
+        return 'Oracle: Offline'
+    }
+  }, [oracleStatus, oracleIdleInfo, oracleCursor])
 
   const deriveLogSnippet = (value: string): string => {
     const trimmed = value.trim()
@@ -366,6 +469,27 @@ export default function App() {
     }
     return undefined
   }, [analyseNewThreshold])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined
+    if (oracleOnline) {
+      window.localStorage.setItem(STORAGE_KEYS.oracleOnline, '1')
+    } else {
+      window.localStorage.removeItem(STORAGE_KEYS.oracleOnline)
+    }
+    return undefined
+  }, [oracleOnline])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined
+    const trimmed = oracleBaseUrl.trim()
+    if (trimmed) {
+      window.localStorage.setItem(STORAGE_KEYS.oracleBaseUrl, trimmed)
+    } else {
+      window.localStorage.removeItem(STORAGE_KEYS.oracleBaseUrl)
+    }
+    return undefined
+  }, [oracleBaseUrl])
 
   useEffect(() => {
     if (!analyseNewActive) {
@@ -899,6 +1023,12 @@ export default function App() {
     if (!refreshJobId) {
       setJobBusy(false)
       lastListRefresh.current = null
+      if (!analyseNewActive) {
+        setOracleIdleInfo(null)
+        if (oracleStatus !== 'unauthorized') {
+          setOracleStatus('offline')
+        }
+      }
       return
     }
 
@@ -911,6 +1041,37 @@ export default function App() {
         const job = await getRefreshJob(jobId)
         if (cancelled) return
         setRefreshJob(job)
+        const statusValue = normalizeOracleStatusValue(job.oracle_status)
+        if (job.oracle_status) {
+          setOracleStatus(statusValue)
+        } else if (!analyseNewActive) {
+          setOracleStatus('offline')
+        }
+        if (statusValue === 'unauthorized') {
+          setOracleBanner('Oracle auth invalid. Set WOS_ORACLE_USER and WOS_ORACLE_PASS.')
+        } else if (job.oracle_status) {
+          setOracleBanner(null)
+        }
+        if (job.oracle_cursor && typeof job.oracle_cursor === 'object') {
+          setOracleCursor({
+            platform: typeof job.oracle_cursor.platform === 'string' ? job.oracle_cursor.platform : null,
+            post_id: typeof job.oracle_cursor.post_id === 'string' ? job.oracle_cursor.post_id : null,
+            scraped_at: typeof job.oracle_cursor.scraped_at === 'string' ? job.oracle_cursor.scraped_at : null,
+          })
+        } else {
+          setOracleCursor(null)
+        }
+        if (
+          typeof job.oracle_poll_seconds === 'number' ||
+          typeof job.oracle_idle_since === 'number'
+        ) {
+          setOracleIdleInfo({
+            pollSeconds: typeof job.oracle_poll_seconds === 'number' ? job.oracle_poll_seconds : null,
+            idleSince: typeof job.oracle_idle_since === 'number' ? job.oracle_idle_since : null,
+          })
+        } else {
+          setOracleIdleInfo(null)
+        }
         if (job.log_tail?.length) updateLog(job.log_tail.join('\n'))
 
         const jobIsActive = job.status === 'queued' || job.status === 'running'
@@ -1000,6 +1161,7 @@ export default function App() {
     analyseNewActive,
     analyseNewThreshold,
     interestFilter,
+    oracleStatus,
     resetAnalyseNewState,
     syncAnalyseNewPending,
   ])
@@ -1194,6 +1356,15 @@ export default function App() {
         resetAnalyseNewState()
         return
       }
+      if (oracleOnline && !oracleBaseUrl.trim()) {
+        const message = 'Set Oracle base URL before enabling online article retrieval.'
+        updateLog((prev) => prev || message)
+        setOracleBanner(message)
+        resetAnalyseNewState()
+        return
+      }
+      setOracleBanner(null)
+      setOracleStatus(oracleOnline ? 'connecting' : 'offline')
       clearAnalyseNewQueues()
       setAnalyseNewRefreshComplete(false)
       setAnalyseNewHadEligible(false)
@@ -1204,7 +1375,12 @@ export default function App() {
       setRefreshJob(null)
       setJobBusy(true)
       try {
-        const start = await startRefreshSummaries({ mode: 'new_only', collectNewPosts: true })
+        const start = await startRefreshSummaries({
+          mode: 'new_only',
+          collectNewPosts: true,
+          oracleOnline: oracleOnline && Boolean(oracleBaseUrl.trim()),
+          oracleBaseUrl: oracleOnline ? oracleBaseUrl.trim() : undefined,
+        })
         setRefreshJobId(start.job_id)
         if (start.conflict) {
           setJobBusy(false)
@@ -1429,6 +1605,7 @@ export default function App() {
 
   return (
     <div className="wrap">
+      {oracleBanner && <div className="oracle-banner">{oracleBanner}</div>}
       {councilProgress && (
         <div className="analysis-overlay">
           <div className="analysis-overlay-content">
@@ -1588,18 +1765,50 @@ export default function App() {
         </div>
 
         <div className="toolbar-row toolbar-analyse-new">
-          <label className={`toolbar-toggle${analyseNewActive ? ' active' : ''}`}>
-            <input
-              type="checkbox"
-              checked={analyseNewActive}
-              onChange={(event) => handleAnalyseNewToggle(event.target.checked)}
-              disabled={
-                working || (!analyseNewActive && (jobActive || councilJobActive || councilJobBusy))
-              }
-            />
-            <span className="toolbar-toggle-track" />
-            <span className="toolbar-toggle-label">Analyse New Articles</span>
-          </label>
+          <div className="toolbar-analyse-new-main">
+            <label className={`toolbar-toggle${analyseNewActive ? ' active' : ''}`}>
+              <input
+                type="checkbox"
+                checked={analyseNewActive}
+                onChange={(event) => handleAnalyseNewToggle(event.target.checked)}
+                disabled={
+                  working || (!analyseNewActive && (jobActive || councilJobActive || councilJobBusy))
+                }
+              />
+              <span className="toolbar-toggle-track" />
+              <span className="toolbar-toggle-label">Analyse New Articles</span>
+            </label>
+            <div className="oracle-controls">
+              <label className="oracle-online-toggle">
+                <input
+                  type="checkbox"
+                  checked={oracleOnline}
+                  onChange={(event) => {
+                    const next = event.target.checked
+                    setOracleOnline(next)
+                    if (!next) {
+                      setOracleStatus('offline')
+                      setOracleBanner(null)
+                    }
+                  }}
+                  disabled={oracleControlsDisabled}
+                />
+                <span>Online source</span>
+              </label>
+              <input
+                type="url"
+                className="oracle-base-url"
+                placeholder="https://oracle.example.com"
+                value={oracleBaseUrl}
+                onChange={(event) => setOracleBaseUrl(event.target.value)}
+                disabled={oracleControlsDisabled}
+              />
+              <div className={`oracle-status ${oracleStatusVariant}`} title={oracleStatusText}>
+                <span className="oracle-status-dot" aria-hidden="true" />
+                <span className="oracle-status-text">{oracleStatusText}</span>
+              </div>
+            </div>
+          </div>
         </div>
 
         <div className="toolbar-row toolbar-slider">

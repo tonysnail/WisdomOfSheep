@@ -336,6 +336,25 @@ details.stage-log pre { margin:8px 0 0; font-size:12px; line-height:1.4; max-hei
 
 .toolbar { display:flex; flex-direction:column; gap:8px; margin: 8px 0 12px; }
 .toolbar-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.toolbar-row.toolbar-analyse-new { align-items:flex-start; gap:16px; }
+.toolbar-analyse-new-main { display:flex; flex-wrap:wrap; gap:14px; align-items:center; }
+.oracle-controls { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.oracle-online-toggle { display:flex; align-items:center; gap:6px; font-size:12px; letter-spacing:0.04em; text-transform:uppercase; color:#9fb2c8; }
+.oracle-online-toggle input { margin:0; }
+.oracle-base-url { min-width:220px; max-width:340px; padding:6px 10px; border-radius:8px; border:1px solid var(--line); background:#101621; color:var(--text); font-size:13px; }
+.oracle-base-url:disabled { opacity:0.5; cursor:not-allowed; filter:saturate(0.4); }
+.oracle-status { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; background:rgba(16, 24, 36, 0.9); border:1px solid rgba(120, 160, 210, 0.25); font-size:12px; letter-spacing:0.03em; text-transform:uppercase; color:var(--muted); box-shadow:0 6px 16px rgba(8, 12, 20, 0.45) inset; }
+.oracle-status-dot { width:10px; height:10px; border-radius:50%; background:var(--muted); box-shadow:0 0 8px rgba(91, 221, 255, 0.35); }
+.oracle-status-text { white-space:nowrap; }
+.oracle-status.positive { color:#6fe1b1; border-color:rgba(111, 225, 177, 0.45); }
+.oracle-status.positive .oracle-status-dot { background:#4fd98f; box-shadow:0 0 10px rgba(79, 217, 143, 0.6); }
+.oracle-status.warning { color:#f6c35b; border-color:rgba(246, 195, 91, 0.4); }
+.oracle-status.warning .oracle-status-dot { background:#f6c35b; box-shadow:0 0 10px rgba(246, 195, 91, 0.55); }
+.oracle-status.negative { color:#ff8080; border-color:rgba(255, 128, 128, 0.45); }
+.oracle-status.negative .oracle-status-dot { background:#ff6b6b; box-shadow:0 0 10px rgba(255, 107, 107, 0.6); }
+.oracle-status.neutral { color:var(--muted); border-color:rgba(120, 140, 170, 0.3); }
+.oracle-status.neutral .oracle-status-dot { background:var(--muted); box-shadow:none; }
+.oracle-banner { background:#3a1414; color:#ffdede; padding:10px 16px; border:1px solid rgba(255, 120, 120, 0.4); border-radius:10px; text-align:center; font-weight:600; letter-spacing:0.04em; }
 .toolbar-primary { justify-content:flex-start; }
 .toolbar-progress-group { display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
 .council-progress-pair {
