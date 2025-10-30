@@ -1598,7 +1598,10 @@ export default function App() {
               <span className="toolbar-toggle-label">Analyse New Articles</span>
             </label>
             <div className="oracle-controls">
-              <label className="oracle-online-toggle">
+              <label
+                className={`oracle-online-toggle${oracleControlsDisabled ? ' disabled' : ''}`}
+                aria-disabled={oracleControlsDisabled}
+              >
                 <input
                   type="checkbox"
                   checked={oracleOnline}
