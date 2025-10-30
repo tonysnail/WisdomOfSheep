@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   listPosts,
   getPost,
@@ -33,6 +33,13 @@ const COUNCIL_STAGE_LABELS: Record<string, string> = {
   direction: 'Direction Council',
   researcher: 'Researcher',
   chairman: 'Chairman Verdict',
+}
+
+const ORACLE_STATUS_MAX_LENGTH = 'Oracle: Processing (last 2025-10-12T20:00:27+00:00 reddit:t3_1o4y3sa)'.length
+
+const truncateOracleStatus = (text: string): string => {
+  if (text.length <= ORACLE_STATUS_MAX_LENGTH) return text
+  return `${text.slice(0, ORACLE_STATUS_MAX_LENGTH - 1)}…`
 }
 
 const normalizeTicker = (value?: string | null): string => {
@@ -331,13 +338,15 @@ export default function App() {
     }
     switch (oracleStatus) {
       case 'connecting':
-        return 'Oracle: Connecting…'
+        return truncateOracleStatus('Oracle: Connecting…')
       case 'warmup':
-        return 'Oracle: Warm-up scan…'
+        return truncateOracleStatus('Oracle: Warm-up scan…')
       case 'processing':
-        return cursorBits.length > 0
-          ? `Oracle: Processing (${cursorBits.join(' · ')})`
-          : 'Oracle: Processing…'
+        return truncateOracleStatus(
+          cursorBits.length > 0
+            ? `Oracle: Processing (${cursorBits.join(' · ')})`
+            : 'Oracle: Processing…',
+        )
       case 'idle': {
         const pollText =
           oracleIdleInfo?.pollSeconds != null
@@ -349,16 +358,16 @@ export default function App() {
           idleSegment = ` • Idle for ${formatEta(elapsed)}`
         }
         const cursorSegment = cursorBits.length > 0 ? ` • ${cursorBits.join(' · ')}` : ''
-        return `Oracle: Idle (poll ${pollText})${idleSegment}${cursorSegment}`
+        return truncateOracleStatus(`Oracle: Idle (poll ${pollText})${idleSegment}${cursorSegment}`)
       }
       case 'unauthorized':
-        return 'Oracle: Unauthorized'
+        return truncateOracleStatus('Oracle: Unauthorized')
       case 'error':
-        return 'Oracle: Error'
+        return truncateOracleStatus('Oracle: Error')
       default:
-        return 'Oracle: Offline'
+        return truncateOracleStatus('Oracle: Offline')
     }
-  }, [oracleStatus, oracleIdleInfo, oracleCursor])
+  }, [oracleStatus, oracleIdleInfo, oracleCursor, truncateOracleStatus])
 
   const deriveLogSnippet = (value: string): string => {
     const trimmed = value.trim()
