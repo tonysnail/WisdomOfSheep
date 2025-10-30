@@ -2267,6 +2267,20 @@ def _worker_refresh_summaries(job_id: str):
             )
             return
 
+        def _reserve_progress_slots(min_remaining: int = 2) -> None:
+            slack = max(int(min_remaining), 2)
+
+            def mutate(job: Dict[str, Any]) -> None:
+                done = int(job.get("done", 0) or 0)
+                total = int(job.get("total", 0) or 0)
+                desired = done + slack
+                if desired > total:
+                    job["total"] = desired
+
+            _job_mutate(job_id, mutate)
+
+        _reserve_progress_slots()
+
         session = requests.Session()
         auth_tuple = _oracle_auth_tuple()
         if auth_tuple:
@@ -2573,6 +2587,34 @@ def _worker_refresh_summaries(job_id: str):
         scanned_count = 0
         last_seen_article: Optional[Dict[str, Any]] = None
         warmup_finished = False
+        warmup_snapshot_count = -1
+
+        def _write_warmup_snapshot(force: bool = False) -> None:
+            nonlocal warmup_snapshot_count
+            if not force and len(warmup_records) == warmup_snapshot_count:
+                return
+            try:
+                _save_oracle_unsummarised(warmup_records, cutoff_iso=warmup_cutoff_iso)
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("failed to update Oracle backlog snapshot")
+                _job_append_log(job_id, f"⚠ failed to update Oracle backlog snapshot: {exc}")
+            else:
+                warmup_snapshot_count = len(warmup_records)
+
+        def _mark_backlog_processed(post_id: str) -> None:
+            nonlocal warmup_records
+            safe_pid = (post_id or "").strip()
+            if not safe_pid or not warmup_records:
+                return
+            filtered = [
+                entry
+                for entry in warmup_records
+                if (entry.get("post_id") or "").strip() != safe_pid
+            ]
+            if len(filtered) == len(warmup_records):
+                return
+            warmup_records = filtered
+            _write_warmup_snapshot()
 
         stats_resp = _request("/wos/stats", min_interval=0.2)
         if stats_resp is not None and stats_resp.ok:
@@ -2643,11 +2685,12 @@ def _worker_refresh_summaries(job_id: str):
 
         if warmup_queue:
             warmup_queue.sort(key=_sort_by_scraped)
-        if warmup_records:
-            warmup_records.sort(key=_sort_by_scraped)
-            _save_oracle_unsummarised(warmup_records, cutoff_iso=warmup_cutoff_iso)
+        warmup_records.sort(key=_sort_by_scraped)
+        _write_warmup_snapshot(force=True)
 
         warmup_total = len(warmup_queue)
+        if warmup_total:
+            _reserve_progress_slots(warmup_total + 1)
         warmup_summary_msg = (
             f"Warm-up queued {warmup_total} unsummarised article(s)"
             if warmup_total
@@ -2690,6 +2733,7 @@ def _worker_refresh_summaries(job_id: str):
                     pending_progress_total = max(warmup_total, 1)
                     pending_progress_index = backlog_processed
                     idle_started = None
+                    _reserve_progress_slots(len(warmup_queue) + 2)
                 else:
                     stats_total = 0
                     stats_resp = _request("/wos/stats", min_interval=1.0)
@@ -2753,6 +2797,7 @@ def _worker_refresh_summaries(job_id: str):
                     pending_progress_index = next_index
                     idle_started = None
                     poll_interval = ORACLE_POLL_BASE
+                    _reserve_progress_slots()
 
             details = _normalize_article(pending_article)
             pid = details["post_id"]
@@ -2809,6 +2854,8 @@ def _worker_refresh_summaries(job_id: str):
                     f"↷ {log_prefix} skipping known failure {scraped_at} {platform}:{pid} — {display_title}"
                 )
                 _job_append_log(job_id, skip_message)
+                if pending_stage == "backlog":
+                    _mark_backlog_processed(pid)
                 cursor_state = {
                     "platform": platform,
                     "post_id": pid,
@@ -2920,6 +2967,8 @@ def _worker_refresh_summaries(job_id: str):
                 )
                 _clear_retry_state()
                 _job_increment(job_id, "done", 1)
+                if pending_stage == "backlog":
+                    _mark_backlog_processed(pid)
                 cursor_state = {
                     "platform": platform,
                     "post_id": pid,
@@ -2984,6 +3033,8 @@ def _worker_refresh_summaries(job_id: str):
                 _run_oracle_council(pid, title, interest_score_val)
 
             _job_increment(job_id, "done", 1)
+            if pending_stage == "backlog":
+                _mark_backlog_processed(pid)
 
             cursor_state = {
                 "platform": platform,
