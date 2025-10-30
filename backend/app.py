@@ -2031,11 +2031,27 @@ def _save_oracle_retry_state(state: Dict[str, Any]) -> None:
 
 
 def _save_oracle_unsummarised(entries: List[Dict[str, Any]], *, cutoff_iso: str) -> None:
+    def _sort_key(item: Dict[str, Any]) -> Tuple[float, str, str]:
+        scraped_raw = str(item.get("scraped_at") or "").strip()
+        ts = float("inf")
+        if scraped_raw:
+            iso_txt = scraped_raw[:-1] + "+00:00" if scraped_raw.endswith("Z") else scraped_raw
+            try:
+                ts = datetime.fromisoformat(iso_txt).timestamp()
+            except ValueError:
+                ts = float("inf")
+        return (ts, scraped_raw, str(item.get("post_id") or ""))
+
+    ordered_entries = [
+        item
+        for item in sorted((entry for entry in entries if isinstance(entry, dict)), key=_sort_key)
+    ]
+
     payload = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "cutoff": cutoff_iso,
-        "count": len(entries),
-        "articles": entries,
+        "count": len(ordered_entries),
+        "articles": ordered_entries,
     }
     tmp_path = ORACLE_UNSUMMARISED_PATH.with_suffix(".tmp")
     with tmp_path.open("w", encoding="utf-8") as handle:
@@ -2043,6 +2059,17 @@ def _save_oracle_unsummarised(entries: List[Dict[str, Any]], *, cutoff_iso: str)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp_path, ORACLE_UNSUMMARISED_PATH)
+
+
+def _clear_oracle_unsummarised() -> None:
+    try:
+        ORACLE_UNSUMMARISED_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+    try:
+        ORACLE_UNSUMMARISED_PATH.with_suffix(".tmp").unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _append_skipped_article_entry(entry: Dict[str, Any], keep: int = 200) -> None:
@@ -2378,6 +2405,38 @@ def _worker_refresh_summaries(job_id: str):
                 oracle_progress_message=message,
             )
 
+        def _sort_by_scraped(entry: Dict[str, Any]) -> Tuple[float, str, str]:
+            scraped_txt = str(entry.get("scraped_at") or "")
+            dt = _parse_scraped(scraped_txt)
+            ts = dt.timestamp() if dt else float("inf")
+            return (ts, scraped_txt, str(entry.get("post_id") or ""))
+
+        def _normalize_article(article: Dict[str, Any]) -> Dict[str, Any]:
+            def _clean(value: Any) -> str:
+                return str(value or "").strip()
+
+            platform = _clean(article.get("platform"))
+            post_id = _clean(article.get("post_id"))
+            scraped_at = _clean(article.get("scraped_at"))
+            if not scraped_at:
+                scraped_at = _clean(article.get("posted_at"))
+            source = _clean(article.get("source"))
+            title = _clean(article.get("title")) or _clean(article.get("headline"))
+
+            normalized = {
+                "platform": platform,
+                "post_id": post_id,
+                "scraped_at": scraped_at,
+                "source": source,
+                "title": title or (post_id if post_id else ""),
+            }
+
+            for key, value in normalized.items():
+                if value:
+                    article[key] = value
+
+            return normalized
+
         def _run_oracle_council(post_id: str, title: str, interest_score: Optional[float]) -> None:
             nonlocal failed_post_ids
             if not oracle_handles_council:
@@ -2580,6 +2639,12 @@ def _worker_refresh_summaries(job_id: str):
             ref_platform = str(tail.get("platform") or "") or None
             ref_post_id = str(tail.get("post_id") or "") or None
 
+            _save_oracle_unsummarised(warmup_records, cutoff_iso=warmup_cutoff_iso)
+
+        if warmup_queue:
+            warmup_queue.sort(key=_sort_by_scraped)
+        if warmup_records:
+            warmup_records.sort(key=_sort_by_scraped)
             _save_oracle_unsummarised(warmup_records, cutoff_iso=warmup_cutoff_iso)
 
         warmup_total = len(warmup_queue)
@@ -4381,6 +4446,10 @@ def start_refresh_summaries(
                     ACTIVE_JOB_ID = None
             raise HTTPException(status_code=500, detail=f"snapshot-failed: {ex}")
     else:
+        try:
+            _clear_oracle_unsummarised()
+        except Exception:
+            pass
         try:
             if not ORACLE_CURSOR_PATH.exists():
                 _save_oracle_cursor(_default_oracle_cursor())
