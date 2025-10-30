@@ -339,8 +339,10 @@ details.stage-log pre { margin:8px 0 0; font-size:12px; line-height:1.4; max-hei
 .toolbar-row.toolbar-analyse-new { align-items:flex-start; gap:16px; }
 .toolbar-analyse-new-main { display:flex; flex-wrap:wrap; gap:14px; align-items:center; }
 .oracle-controls { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
-.oracle-online-toggle { display:flex; align-items:center; gap:6px; font-size:12px; letter-spacing:0.04em; text-transform:uppercase; color:#9fb2c8; }
+.oracle-online-toggle { display:flex; align-items:center; gap:6px; font-size:12px; letter-spacing:0.04em; text-transform:uppercase; color:#9fb2c8; transition:opacity 0.2s ease, color 0.2s ease; }
 .oracle-online-toggle input { margin:0; }
+.oracle-online-toggle.disabled { opacity:0.45; color:var(--muted); cursor:not-allowed; }
+.oracle-online-toggle.disabled span { color:var(--muted); }
 .oracle-base-url { min-width:220px; max-width:340px; padding:6px 10px; border-radius:8px; border:1px solid var(--line); background:#101621; color:var(--text); font-size:13px; }
 .oracle-base-url:disabled { opacity:0.5; cursor:not-allowed; filter:saturate(0.4); }
 .oracle-status { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; background:rgba(16, 24, 36, 0.9); border:1px solid rgba(120, 160, 210, 0.25); font-size:12px; letter-spacing:0.03em; text-transform:uppercase; color:var(--muted); box-shadow:0 6px 16px rgba(8, 12, 20, 0.45) inset; }
