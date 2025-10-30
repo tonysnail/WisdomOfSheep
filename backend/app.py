@@ -72,6 +72,7 @@ except Exception as exc:  # noqa: BLE001
 # =========================
 # Config (env-overridable)
 # =========================
+LOGGER = logging.getLogger(__name__)
 DB_PATH = ROOT / "council" / "wisdom_of_sheep.sql"
 TIME_MODEL_PATH = ROOT / "council" / "council_time_model.json"
 CSV_PATH = ROOT / "raw_posts_log.csv"
@@ -223,6 +224,7 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def _q_all(conn: sqlite3.Connection, sql: str, params: Tuple[Any, ...]) -> List[sqlite3.Row]:
     cur = conn.execute(sql, params)
@@ -2830,28 +2832,17 @@ def posts_calendar(
     return PostsCalendarResponse(days=days)
 
 
-@app.get("/api/posts")
-def list_posts(
-    q: Optional[str] = Query(None, description="Search in title/text"),
-    platform: Optional[str] = None,
-    source: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    interest_min: Optional[float] = Query(None, ge=0.0, le=100.0),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(PAGE_SIZE_DEFAULT, ge=1, le=500),
-):
-    if not isinstance(q, str):
-        q = None
-    if not isinstance(platform, str):
-        platform = None
-    if not isinstance(source, str):
-        source = None
-    if not isinstance(date_from, str):
-        date_from = None
-    if not isinstance(date_to, str):
-        date_to = None
-
+def _list_posts_from_db(
+    *,
+    q: Optional[str],
+    platform: Optional[str],
+    source: Optional[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+    interest_min: Optional[float],
+    page: int,
+    page_size: int,
+) -> Dict[str, Any]:
     offset = (page - 1) * page_size
 
     where = ["1=1"]
@@ -2923,7 +2914,8 @@ def list_posts(
     sql_count = f"SELECT COUNT(*) AS n FROM posts p WHERE {where_sql}"
 
     with _connect() as conn:
-        total = _q_one(conn, sql_count, tuple(params))["n"]
+        total_row = _q_one(conn, sql_count, tuple(params))
+        total = int(total_row["n"] if total_row and total_row["n"] is not None else 0)
         rows = _q_all(conn, sql_items, tuple(params + [page_size, offset]))
 
         items: List[Dict[str, Any]] = []
@@ -3032,8 +3024,45 @@ def list_posts(
         "page_size": page_size,
     }
 
-@app.get("/api/posts/{post_id:path}")
-def get_post(post_id: str):
+
+@app.get("/api/posts")
+def list_posts(
+    q: Optional[str] = Query(None, description="Search in title/text"),
+    platform: Optional[str] = None,
+    source: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    interest_min: Optional[float] = Query(None, ge=0.0, le=100.0),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(PAGE_SIZE_DEFAULT, ge=1, le=500),
+):
+    if not isinstance(q, str):
+        q = None
+    if not isinstance(platform, str):
+        platform = None
+    if not isinstance(source, str):
+        source = None
+    if not isinstance(date_from, str):
+        date_from = None
+    if not isinstance(date_to, str):
+        date_to = None
+
+    try:
+        return _list_posts_from_db(
+            q=q,
+            platform=platform,
+            source=source,
+            date_from=date_from,
+            date_to=date_to,
+            interest_min=float(interest_min) if isinstance(interest_min, (int, float)) else None,
+            page=page,
+            page_size=page_size,
+        )
+    except sqlite3.DatabaseError as exc:
+        LOGGER.error("list-posts-db-error: %s", exc)
+        raise HTTPException(status_code=500, detail="database-unavailable") from exc
+
+def _get_post_from_db(post_id: str) -> Dict[str, Any]:
     with _connect() as conn:
         p = _q_one(conn, "SELECT * FROM posts WHERE post_id = ?", (post_id,))
         if not p:
@@ -3103,6 +3132,15 @@ def get_post(post_id: str):
             )
 
         return PostDetail(post=post, extras=extras, stages=stages, interest=interest_record).model_dump()
+
+
+@app.get("/api/posts/{post_id:path}")
+def get_post(post_id: str):
+    try:
+        return _get_post_from_db(post_id)
+    except sqlite3.DatabaseError as exc:
+        LOGGER.error("get-post-db-error: %s", exc)
+        raise HTTPException(status_code=500, detail="database-unavailable") from exc
 
 # ---------- Refresh from CSV ----------
 
