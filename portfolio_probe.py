@@ -23,6 +23,33 @@ Perform Backtest with default values:
       --interval auto --intraday-limit-days 59 --verbose 2
 
 
+
+
+
+Warm the Cache between a Date Range so the Stable Island GA Detector can work without needing to pull yfinance data:
+
+    python portfolio_probe.py \
+      --db council/wisdom_of_sheep.sql \
+      --start 2025-09-20 --end 2025-10-22 \
+      --interval auto --intraday-limit-days 59 \
+      --warm-only --verbose 2
+
+
+Full GA Island Detection after Cache is warmed:     [ Writes verbose output to log files in portfolio/   -  going easy on the Terminal Window ]
+
+    (venv) python portfolio_ga_marathon.py \
+      --db council/wisdom_of_sheep.sql \
+      --start 2025-09-20 --end 2025-10-22 \
+      --pop 80 --gens 120 --tournament-k 5 --cx 0.9 --mut 0.25 \
+      --interval auto --intraday-limit-days 59 \
+      --initial-equity 100000 --verbose 1 \
+      --runs 6 --seeds 42,1337,7,11,23,101 --name oct_window \
+      --console key --gen-goal 120 \
+      | tee "logs/ga_marathon_$(date -u +%Y%m%dT%H%M%SZ)_oct_window.log"
+
+
+
+
 This version:
   - Treats Chairman verdict fields as first-class GA genes & decision gates.
   - Adds catalyst/watchout scoring and consistency in the fitness.
@@ -142,6 +169,56 @@ _enriched_loaded = False
 # Utilities
 # ============================================================
 
+def load_genes_file(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Genes file not found: {p}")
+    try:
+        return json.loads(p.read_text())
+    except Exception as exc:
+        raise RuntimeError(f"Failed to parse genes JSON at {p}: {exc}") from exc
+
+def run_backtest_from_genes(
+    conn: sqlite3.Connection,
+    genes: dict,
+    *,
+    start: str,
+    end: str,
+    initial_equity: float,
+    ticker_filter: Optional[str],
+    interval: str,
+    intraday_limit_days: int
+) -> dict:
+    # Convert GA gene → backtest params + gates
+    params = genes_to_params(genes)
+    gates  = genes_to_gates(genes)
+
+    vprint(1, "\n[RUN] Backtest from genes:")
+    vprint(1, f"      start={start} end={end} initial_equity={initial_equity:,.2f}")
+    vprint(2, f"      params={params}")
+    vprint(2, f"      gates={gates}")
+
+    res = backtest(
+        conn,
+        params,
+        start=start,
+        end=end,
+        initial_equity=initial_equity,
+        ticker_filter=ticker_filter,
+        cache={},  # fresh cache for clarity; reuse if you prefer
+        gates=gates,
+        interval=interval,
+        intraday_limit_days=intraday_limit_days,
+    )
+
+    metrics = res.get("metrics", {})
+    vprint(1, "\n[BT] Metrics:")
+    vprint(1, json.dumps(metrics, indent=2))
+    vprint(1, f"[BT] Trades CSV: {res.get('trades_csv')}")
+    vprint(1, "[BT] Done.")
+
+    return res
+
 def _map_interval_from_timeframe(tf: str) -> str:
     tf = (tf or "").lower()
     if tf == "intraday":
@@ -151,6 +228,13 @@ def _map_interval_from_timeframe(tf: str) -> str:
     if tf == "swing_weeks":
         return "4h"
     return "1d"
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else (hi if x > hi else x)
+
+def safe_div(num, den, eps=1e-9):
+    d = den if abs(den) > eps else (eps if den >= 0 else -eps)
+    return num / d
 
 def _decide_row_interval(row_tf: Optional[str], global_interval: str) -> str:
     if global_interval and global_interval != "auto":
@@ -330,6 +414,12 @@ def cached_fetch_indicator_series(ticker: str, start: Optional[str] = None, end:
 
     vprint(2, f"[CACHE] miss {tkr} {start}→{end} @{interval} — fetching")
 
+    # throttle only on actual fetch (miss path)
+    try:
+        throttle_yfinance()
+    except Exception:
+        pass
+
     # Gracefully pass interval through; fallback if your function doesn't accept it yet
     try:
         df = fetch_indicator_series(tkr, start=start, end=end, period_days=period_days, interval=interval)
@@ -403,6 +493,71 @@ def resolve_yf_symbol(raw_sym: Optional[str], start: str, end: str) -> Optional[
     _resolve_cache_bad.add(raw)
     vprint(1, f"[RESOLVE] Failed to resolve: {raw}")
     return None
+
+
+# ============================================================
+# Cache warming helpers
+# ============================================================
+
+def _effective_intraday_window(start: str, end: str, intraday_limit_days: int) -> Tuple[str, str]:
+    """Clamp the lookback for sub-hourly bars (vendor limits)."""
+    try:
+        end_ts = pd.Timestamp(end).normalize() + pd.Timedelta(days=1)
+        start_ts = end_ts - pd.Timedelta(days=intraday_limit_days)
+        orig_start = pd.Timestamp(start)
+        eff_start = max(start_ts, orig_start).strftime("%Y-%m-%d")
+        eff_end = pd.Timestamp(end).strftime("%Y-%m-%d")
+        return eff_start, eff_end
+    except Exception:
+        return start, end
+
+
+def warm_cache(conn: sqlite3.Connection, start: str, end: str, interval: str, intraday_limit_days: int) -> None:
+    """
+    Prefetch all (ticker, interval) series needed for the window,
+    mirroring the same interval bucketing logic used in backtest().
+    """
+    vprint(1, f"[WARM] Starting cache warm — window {start}→{end}  interval={interval}  intraday_limit_days={intraday_limit_days}")
+
+    q = """
+    SELECT ticker, timeframe, article_date
+    FROM chairman_flat_v3
+    WHERE ticker IS NOT NULL AND TRIM(ticker) <> ''
+      AND implied_direction IS NOT NULL
+      AND date(article_date) BETWEEN date(?) AND date(?)
+    ORDER BY ticker, article_date
+    """
+    rows = conn.execute(q, (start, end)).fetchall()
+    if not rows:
+        vprint(1, "[WARM] No rows found to warm.")
+        return
+
+    from collections import defaultdict
+    groups: Dict[str, Dict[str, bool]] = defaultdict(dict)
+
+    for raw_tkr, tf, _ts in rows:
+        eff_int = _decide_row_interval(tf, interval)
+        groups[raw_tkr][eff_int] = True
+
+    warmed = 0
+    skipped_resolve = 0
+    for raw_tkr, ints in groups.items():
+        yf_sym = resolve_yf_symbol(raw_tkr, start, end)
+        if not yf_sym:
+            vprint(2, f"[WARM] Resolve failed for {raw_tkr}; skip")
+            skipped_resolve += 1
+            continue
+        for row_interval in ints.keys():
+            use_start, use_end = (start, end)
+            if _interval_is_intraday(row_interval):
+                use_start, use_end = _effective_intraday_window(start, end, intraday_limit_days)
+            vprint(2, f"[WARM] {raw_tkr}→{yf_sym} @{row_interval} {use_start}→{use_end}")
+            df = cached_fetch_indicator_series(yf_sym, start=use_start, end=use_end, interval=row_interval)
+            if df is not None and not df.empty:
+                warmed += 1
+
+    vprint(1, f"[WARM] Finished. Series warmed: {warmed}. Unresolved tickers: {skipped_resolve}.")
+
 
 # ============================================================
 # TEMP VIEW (read-only DB compat)
@@ -809,7 +964,6 @@ def load_price_history(yf, ticker: str, start: str, end: str, interval: str) -> 
     tries, backoff, last_exc = 3, 0.75, None
     for i in range(tries):
         try:
-            throttle_yfinance()
             df = cached_fetch_indicator_series(tick, start=start, end=end, interval=interval)
             if df is None or df.empty:
                 vprint(1, f"⚠️  No price data for {tick} @{interval}; skipping.")
@@ -822,8 +976,8 @@ def load_price_history(yf, ticker: str, start: str, end: str, interval: str) -> 
             last_exc = exc
             msg = str(exc).lower()
             permanent = any(s in msg for s in (
-                "possibly delisted", "no price data", "not found", "quote not found",
-                "no timezone found", "yftzmissingerror"
+                #"possibly delisted", "no price data", "not found", "quote not found",
+                #"no timezone found", "yftzmissingerror"
             ))
             transient = any(s in msg for s in (
                 "too many requests", "timed out", "temporarily unavailable",
@@ -981,53 +1135,111 @@ def _safe_cagr(initial_equity: float, end_equity: float, t0, t1) -> float:
         return 0.0
 
 def compute_metrics(trades_df: pd.DataFrame, initial_equity: float) -> Dict[str, float]:
+    # Empty-safe defaults
+    empty = {
+        "trades": 0, "total_pnl": 0.0, "win_rate": 0.0,
+        "cagr": 0.0, "sharpe": 0.0, "sortino": 0.0, "profit_factor": 0.0,
+        "max_dd": 0.0, "calmar": 0.0, "vol": 0.0, "expectancy": 0.0,
+        "end_equity": float(initial_equity),
+        "mean_pretrade_score": 0.0, "watchout_hits": 0.0,
+        "score": 0.0,
+    }
     if trades_df is None or trades_df.empty:
-        return {"trades": 0, "total_pnl": 0.0, "win_rate": 0.0, "cagr": 0.0, "sharpe": 0.0,
-                "sortino": 0.0, "profit_factor": 0.0, "max_dd": 0.0, "calmar": 0.0,
-                "vol": 0.0, "expectancy": 0.0, "end_equity": initial_equity,
-                "mean_pretrade_score": 0.0, "watchout_hits": 0.0}
+        return empty
 
+    # Core tallies
     equity = trades_df["equity_after"].tolist()
     total_pnl = float(trades_df["pnl"].sum())
     wins = int((trades_df["pnl"] > 0).sum())
     win_rate = wins / len(trades_df) if len(trades_df) > 0 else 0.0
 
+    # Timeline / CAGR
     t0 = trades_df["entry_time"].min()
     t1 = trades_df["exit_time"].max()
     end_equity = float(equity[-1]) if equity else float(initial_equity)
-    cagr = _safe_cagr(initial_equity, end_equity, t0, t1)
+    cagr_raw = _safe_cagr(initial_equity, end_equity, t0, t1)
 
+    # Return series → Sharpe/Sortino/Vol
     trade_rets = _equity_to_returns(equity)
     if trade_rets:
         s = pd.Series(trade_rets)
-        avg = s.mean(); std = s.std(ddof=0)
-        sharpe = (avg / std) * math.sqrt(252) if std > 0 else 0.0
-        downside = pd.Series([min(0, r) for r in trade_rets])
-        dd_std = downside.std(ddof=0)
-        sortino = (avg / dd_std) * math.sqrt(252) if dd_std > 0 else 0.0
-        vol = std * math.sqrt(252)
+        avg = float(s.mean())
+        std = float(s.std(ddof=0))
+        sharpe_raw = (avg / std) * math.sqrt(252) if std > 0 else 0.0
+        downside = pd.Series([min(0.0, r) for r in trade_rets])
+        dd_std = float(downside.std(ddof=0))
+        sortino_raw = (avg / dd_std) * math.sqrt(252) if dd_std > 0 else 0.0
+        vol_raw = std * math.sqrt(252)
     else:
-        sharpe = 0.0; sortino = 0.0; vol = 0.0
+        avg = 0.0; std = 0.0; sharpe_raw = 0.0; sortino_raw = 0.0; vol_raw = 0.0
 
+    # Profit factor
     gross_profit = float(trades_df.loc[trades_df["pnl"] > 0, "pnl"].sum())
     gross_loss = float(-trades_df.loc[trades_df["pnl"] < 0, "pnl"].sum())
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+    pf_raw = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
 
-    max_dd = _max_drawdown([initial_equity] + equity, initial_equity)
-    calmar = (cagr / max_dd) if max_dd > 1e-9 else float("inf")
+    # Max DD / Calmar
+    max_dd_raw = _max_drawdown([initial_equity] + equity, initial_equity)
+    calmar_raw = (cagr_raw / max_dd_raw) if max_dd_raw > 1e-9 else float("inf")
 
+    # Expectancy
     expectancy = float(trades_df["pnl"].mean()) if len(trades_df) > 0 else 0.0
 
+    # Optional diagnostics from signal_info
     mean_pretrade_score = 0.0
     watchout_hits = 0.0
     if "signal_info" in trades_df.columns:
         try:
             s = trades_df["signal_info"].apply(lambda x: x.get("pretrade_score") if isinstance(x, dict) else None).dropna()
-            if len(s) > 0: mean_pretrade_score = float(pd.Series(s).mean())
+            if len(s) > 0:
+                mean_pretrade_score = float(pd.Series(s).mean())
             w = trades_df["signal_info"].apply(lambda x: 1.0 if (isinstance(x, dict) and x.get("watchout_hit")) else 0.0)
             watchout_hits = float(pd.Series(w).mean())
         except Exception:
             pass
+
+    # === Stabilise & normalise (bounded metrics) ===
+    pf       = clamp(safe_div(gross_profit, abs(gross_loss)), 0.0, 10.0)
+    sharpe   = clamp(sharpe_raw, -5.0, 5.0)
+    sortino  = clamp(sortino_raw, -5.0, 5.0)
+    max_dd   = clamp(max_dd_raw, 0.0, 1.0)           # 0..1
+    cagr     = clamp(cagr_raw, -1.0, 3.0)            # -100%..+200%/yr
+    vol      = clamp(vol_raw, 0.0, 1.0)
+    win_rate = clamp(win_rate, 0.0, 1.0)
+
+    # Normalised 0..1
+    cagr_n    = (cagr + 1.0) / 4.0                   # [-1,3] → [0,1]
+    maxdd_n   = 1.0 - max_dd
+    pf_n      = pf / 10.0
+    sharpe_n  = (sharpe + 5.0) / 10.0
+    sortino_n = (sortino + 5.0) / 10.0
+    win_n     = win_rate
+    vol_n     = 1.0 - min(vol, 1.0)                  # prefer lower vol
+
+    # Gates / regularisation (soft penalties)
+    trades_gate = 1.0 if len(trades_df) >= 30 else (len(trades_df) / 30.0)
+    # Optional hold-time regulariser if present on rows
+    if "bars_held" in trades_df.columns:
+        target_hold_bars = 20
+        avg_hold_bars = float(pd.to_numeric(trades_df["bars_held"], errors="coerce").fillna(0).mean() or 0.0)
+        hold_gate = clamp(avg_hold_bars / target_hold_bars, 0.0, 1.0)
+    else:
+        hold_gate = 1.0
+
+    composite_score = (
+        1.00 * cagr_n +
+        0.40 * sharpe_n +
+        0.25 * sortino_n +
+        0.35 * pf_n +
+        0.30 * maxdd_n +
+        0.10 * win_n +
+        0.10 * vol_n
+    ) * trades_gate * hold_gate
+
+    # Guard against NaN/Inf
+    if any(map(lambda x: isinstance(x, float) and (math.isnan(x) or math.isinf(x)),
+               [pf, sharpe, sortino, max_dd, cagr, vol, composite_score])):
+        composite_score = 0.0
 
     return {
         "trades": int(len(trades_df)),
@@ -1036,14 +1248,15 @@ def compute_metrics(trades_df: pd.DataFrame, initial_equity: float) -> Dict[str,
         "cagr": cagr,
         "sharpe": sharpe,
         "sortino": sortino,
-        "profit_factor": profit_factor,
+        "profit_factor": pf,
         "max_dd": max_dd,
-        "calmar": calmar,
+        "calmar": safe_div(cagr, max_dd) if max_dd > 0 else float("inf"),
         "vol": vol,
         "expectancy": expectancy,
         "end_equity": end_equity,
         "mean_pretrade_score": mean_pretrade_score,
-        "watchout_hits": watchout_hits
+        "watchout_hits": watchout_hits,
+        "score": composite_score,  # <— bounded score for GA
     }
 
 def compute_fitness(metrics: Dict[str, float],
@@ -1122,14 +1335,12 @@ def backtest(conn: sqlite3.Connection, params: StrategyParams, start: str, end: 
         print("⚠️  yfinance not installed — skipping backtest. pip install yfinance")
         return {}
 
-    # NOTE: If user asks for sub-hourly bars across a long window, clamp effective window to 'intraday_limit_days'
+    # Respect vendor intraday limits by clamping the effective window
     eff_start, eff_end = start, end
     if _interval_is_intraday(interval):
-        # clamp to last N days of [start,end] to respect vendor limits
         try:
-            end_ts = pd.Timestamp(end).normalize() + pd.Timedelta(days=1)  # include end day
-            start_ts = pd.Timestamp(end_ts) - pd.Timedelta(days=intraday_limit_days)
-            # but don't exceed original start
+            end_ts = pd.Timestamp(end).normalize() + pd.Timedelta(days=1)
+            start_ts = end_ts - pd.Timedelta(days=intraday_limit_days)
             orig_start = pd.Timestamp(start)
             eff_start = max(start_ts, orig_start).strftime("%Y-%m-%d")
             eff_end = pd.Timestamp(end).strftime("%Y-%m-%d")
@@ -1153,24 +1364,26 @@ def backtest(conn: sqlite3.Connection, params: StrategyParams, start: str, end: 
     rows = [dict(zip(cols, r)) for r in conn.execute(q, args).fetchall()]
     if not rows:
         vprint(1, "No rows to backtest.")
-        return {}
+        metrics = compute_metrics(pd.DataFrame(), initial_equity)
+        (PORTFOLIO_DIR / "last_metrics.json").write_text(json.dumps(metrics, indent=2))
+        return {"metrics": metrics, "trades": [], "equity_curve": [initial_equity], "trades_csv": str(PORTFOLIO_DIR / "backtest_trades.csv")}
 
     vprint(1, f"[BT] Rows: {len(rows)} | Window: {start}→{end} | Equity: {initial_equity:.2f}")
 
     equity = initial_equity
     equity_curve = [equity]
-    trades = []
+    trades: List[Dict[str, Any]] = []
     price_cache = cache if cache is not None else {}
     open_until: Dict[str, pd.Timestamp] = {} if params.one_position_per_ticker else {}
 
     for raw_tkr, group in _group_by(rows, key=lambda x: x.get("ticker")):
         yf_sym = resolve_yf_symbol(raw_tkr, eff_start, eff_end)
         if not yf_sym:
-            vprint(1, f"⚠️  Resolve failed: '{raw_tkr}' → skip"); continue
+            vprint(1, f"⚠️  Resolve failed: '{raw_tkr}' → skip")
+            continue
 
-        # We may need multiple intervals for the same ticker if --interval=auto
-        # So we group the group by decided interval.
-        sub_buckets = {}
+        # Bucket by interval if using auto
+        sub_buckets: Dict[str, List[Dict[str, Any]]] = {}
         for r in group:
             row_int = _decide_row_interval(r.get("timeframe"), interval)
             sub_buckets.setdefault(row_int, []).append(r)
@@ -1178,7 +1391,6 @@ def backtest(conn: sqlite3.Connection, params: StrategyParams, start: str, end: 
         for row_interval, subrows in sub_buckets.items():
             cache_key = f"{yf_sym}@{row_interval}"
             if cache_key not in price_cache:
-                # If interval is intraday, re-apply intraday clamp
                 use_start, use_end = eff_start, eff_end
                 if _interval_is_intraday(row_interval):
                     try:
@@ -1192,11 +1404,10 @@ def backtest(conn: sqlite3.Connection, params: StrategyParams, start: str, end: 
 
                 df = load_price_history(yf, yf_sym, use_start, use_end, row_interval)
                 if df is None:
-                    vprint(1, f"⚠️  No price data for {yf_sym} @{row_interval}; skip"); 
+                    vprint(1, f"⚠️  No price data for {yf_sym} @{row_interval}; skip")
                     continue
 
                 df.index = pd.to_datetime(df.index, utc=True)
-
                 if params.stop_type == "atr":
                     df["ATR"] = pd.Series(compute_atr(df, params.atr_period), index=df.index).ffill()
 
@@ -1211,7 +1422,7 @@ def backtest(conn: sqlite3.Connection, params: StrategyParams, start: str, end: 
             ann_vol = annualized_vol(ret.to_list())
 
             for r in subrows:
-                ts_str = r.get("article_date")    
+                ts_str = r.get("article_date")
                 try:
                     ts = pd.Timestamp(ts_str).tz_convert("UTC") if pd.Timestamp(ts_str).tzinfo else pd.Timestamp(ts_str, tz="UTC")
                 except Exception:
@@ -1219,28 +1430,31 @@ def backtest(conn: sqlite3.Connection, params: StrategyParams, start: str, end: 
 
                 if params.one_position_per_ticker and raw_tkr in open_until:
                     if ts <= open_until[raw_tkr]:
-                        vprint(2, f"[BT] skip {raw_tkr}@{ts} — active position until {open_until[raw_tkr]}")
+                        vprint(2, f"[BT] skip {raw_tkr}@{ts} — active until {open_until[raw_tkr]}")
                         continue
 
                 no_pos = decide_no_position(r, params, gates=gates)
                 action = no_pos["action"]
-                side = "long" if action == "consider_buy" else "short" if action in ("consider_short","watch_for_relief_then_short") else None
+                side = "long" if action == "consider_buy" else ("short" if action in ("consider_short", "watch_for_relief_then_short") else None)
                 vprint(2, f"[BT]  {raw_tkr}@{ts.isoformat()} @{row_interval} → action={action} side={side} why={no_pos.get('why')}")
                 if side is None:
                     continue
 
                 snap = df[df.index >= ts]
                 if snap.empty:
-                    vprint(2, "[BT]   no future bars; skip"); continue
+                    vprint(2, "[BT]   no future bars; skip"); 
+                    continue
+
                 snap_ts = snap.index[0]
                 approx_entry = float(snap.loc[snap_ts, "Open"])
                 atr_val = float(df.loc[:snap_ts, "ATR"].iloc[-1]) if ("ATR" in df.columns and not df.loc[:snap_ts, "ATR"].empty) else None
                 stop_approx, _ = derive_initial_stops(approx_entry, side, params, atr_val)
                 shares = compute_position_size(equity, approx_entry, stop_approx, params, ann_vol)
 
-                sim = simulate_trade_stream(df, side, ts, params, use_atr=(params.stop_type=="atr"))
+                sim = simulate_trade_stream(df, side, ts, params, use_atr=(params.stop_type == "atr"))
                 if not sim.get("filled"):
-                    vprint(2, "[BT]   not filled; skip"); continue
+                    vprint(2, "[BT]   not filled; skip")
+                    continue
 
                 bps = params.slippage_bps / 10000.0
                 pnl_per_share = sim["pnl_per_share"] - approx_entry * bps
@@ -1249,13 +1463,14 @@ def backtest(conn: sqlite3.Connection, params: StrategyParams, start: str, end: 
                 equity_curve.append(equity)
 
                 pre_score = pretrade_score_row(r, gates) if gates else 0.0
-                watchout_hit = _tag_any_contains(_parse_json_array(r.get("watchouts_json")), ("nasdaq","delist","reverse split"))
+                watchout_hit = _tag_any_contains(_parse_json_array(r.get("watchouts_json")), ("nasdaq", "delist", "reverse split"))
 
                 trades.append({
                     "ticker": raw_tkr,
                     "yf_ticker": yf_sym,
                     "side": side,
-                    "signal_time": ts, "entry_time": sim["entry_time"], "exit_time": sim["exit_time"],
+                    "signal_time": ts,
+                    "entry_time": sim["entry_time"], "exit_time": sim["exit_time"],
                     "entry": sim["entry_price"], "exit": sim["exit_price"],
                     "shares": shares, "pnl": pnl, "equity_after": equity,
                     "partial": sim["partial_taken"], "stop": sim["stop"], "target": sim["target"],
@@ -1268,8 +1483,9 @@ def backtest(conn: sqlite3.Connection, params: StrategyParams, start: str, end: 
                 if params.one_position_per_ticker:
                     open_until[raw_tkr] = sim["exit_time"]
 
-    df_tr = pd.DataFrame(trades)
+    # Wrap up
     out_csv = PORTFOLIO_DIR / "backtest_trades.csv"
+    df_tr = pd.DataFrame(trades)
     if df_tr.empty:
         vprint(1, "No executed trades.")
         metrics = compute_metrics(df_tr, initial_equity)
@@ -1288,10 +1504,14 @@ def backtest(conn: sqlite3.Connection, params: StrategyParams, start: str, end: 
     print(f"  Max drawdown: {max_dd*100:.1f}%")
     print(f"  Trades CSV: {out_csv}")
 
-    metrics = compute_metrics(df_tr, initial_equity)
+    metrics = compute_metrics(df_tr, initial_equity)  # <-- includes bounded composite 'score'
     (PORTFOLIO_DIR / "last_metrics.json").write_text(json.dumps(metrics, indent=2))
-    return {"trades_csv": str(out_csv), "trades": trades, "metrics": metrics,
-            "equity_curve": [initial_equity] + df_tr["equity_after"].tolist()}
+    return {
+        "trades_csv": str(out_csv),
+        "trades": trades,
+        "metrics": metrics,
+        "equity_curve": [initial_equity] + df_tr["equity_after"].tolist()
+    }
 
 # ============================================================
 # GA — search space (Chairman-aware)
@@ -1506,28 +1726,21 @@ def ga_optimize(conn: sqlite3.Connection, start: str, end: str, initial_equity: 
     def score_ind(gene: Dict[str,Any]) -> Tuple[float, Dict[str,float]]:
         params = genes_to_params(gene)
         gates  = genes_to_gates(gene)
-        bt = backtest(conn, params, start=start, end=end, initial_equity=initial_equity,
-                      ticker_filter=ticker_filter, cache=price_cache, gates=gates,
-                      interval=weights.get("_interval", "auto"),  # placeholder; overridden below
-                      intraday_limit_days=int(weights.get("_intraday_limit_days", 59)))
-        metrics = bt.get("metrics", {"trades":0})
-        score = compute_fitness(
-            metrics,
-            w_cagr   = weights.get("w_cagr",1.0),
-            w_sharpe = weights.get("w_sharpe",0.5),
-            w_sortino= weights.get("w_sortino",0.3),
-            w_pf     = weights.get("w_pf",0.2),
-            w_win    = weights.get("w_win",0.0),
-            w_exp    = weights.get("w_exp",0.1),
-            w_maxdd  = weights.get("w_maxdd",-0.5),
-            w_vol    = weights.get("w_vol",0.0),
-            w_cons   = gene.get("w_cons", 0.3),
-            w_trades = gene.get("w_trades", 0.2),
-            min_trades_required=int(gene.get("min_trades_required", 10))
+        bt = backtest(
+            conn, params,
+            start=start, end=end, initial_equity=initial_equity,
+            ticker_filter=ticker_filter, cache=price_cache, gates=gates,
+            interval=weights.get("_interval", "auto"),
+            intraday_limit_days=int(weights.get("_intraday_limit_days", 59)),
         )
+        metrics = bt.get("metrics", {"trades": 0, "score": 0.0})
+        # Prefer the bounded score computed inside compute_metrics
+        score = float(metrics.get("score", 0.0))
+        if math.isnan(score) or math.isinf(score):
+            score = -1.0  # hard penalty for pathological metrics
         return score, metrics
 
-    # Seed population scoring
+    # Seed scoring
     for i, g in enumerate(population, start=1):
         vprint(1, f"[GA] seed {i}/{len(population)}")
         s, m = score_ind(g)
@@ -1542,8 +1755,8 @@ def ga_optimize(conn: sqlite3.Connection, start: str, end: str, initial_equity: 
 
         scores_only = [s for (_, s, _) in scored]
         mean_s = float(pd.Series(scores_only).mean()) if scores_only else 0.0
-        med_s = float(pd.Series(scores_only).median()) if scores_only else 0.0
-        std_s = float(pd.Series(scores_only).std(ddof=0)) if scores_only else 0.0
+        med_s  = float(pd.Series(scores_only).median()) if scores_only else 0.0
+        std_s  = float(pd.Series(scores_only).std(ddof=0)) if scores_only else 0.0
         trades_counts = [m.get("trades", 0) for (_, _, m) in scored]
         mean_tr = float(pd.Series(trades_counts).mean()) if trades_counts else 0.0
         smell = (best_score / med_s) if med_s else float("inf")
@@ -1554,7 +1767,6 @@ def ga_optimize(conn: sqlite3.Connection, start: str, end: str, initial_equity: 
         print(f"     mean={mean_s:.4f}  median={med_s:.4f}  std={std_s:.4f}  "
               f"avg_trades={mean_tr:.1f}  smell={smell:.2f}")
 
-        # persist a rolling GA log row
         all_log_rows.append({
             "gen": gen,
             "best_score": best_score,
@@ -1611,12 +1823,10 @@ def ga_optimize(conn: sqlite3.Connection, start: str, end: str, initial_equity: 
           f"CAGR={best_metrics.get('cagr',0):.2%}  PF={best_metrics.get('profit_factor',0):.2f}  "
           f"Sharpe={best_metrics.get('sharpe',0):.2f}  MaxDD={best_metrics.get('max_dd',0):.2%}")
 
-    # Save outputs
     (PORTFOLIO_DIR / "best_genes.json").write_text(json.dumps(best_gene, indent=2))
     (PORTFOLIO_DIR / "best_metrics.json").write_text(json.dumps(best_metrics, indent=2))
     pd.DataFrame(all_log_rows).to_csv(PORTFOLIO_DIR / "ga_log.csv", index=False)
 
-    # Return a compact summary for programmatic use
     return {
         "best_gene": best_gene,
         "best_score": best_score,
@@ -1686,6 +1896,25 @@ def main():
         help="Max lookback window (days) for sub-hourly bars (Yahoo often ~60d)."
     )
 
+    # Using precalculated GA results
+    ap.add_argument(
+        "--use-best",
+        action="store_true",
+        help="Load genes from a JSON file (default: portfolio/best_genes.json) and run a single backtest with them."
+    )
+    ap.add_argument(
+        "--genes-file",
+        default=str(PORTFOLIO_DIR / "best_genes.json"),
+        help="Path to a genes JSON produced by GA (default: portfolio/best_genes.json)."
+    )
+
+    # Cache warmer
+    ap.add_argument("--warm-cache", action="store_true",
+                    help="Warm the price cache for all (ticker,interval) combos needed by this window.")
+    ap.add_argument("--warm-only", action="store_true",
+                    help="Perform cache warm then exit without running GA/backtest.")
+
+
     # Misc
     ap.add_argument("--clear-cache", action="store_true", help="Clear price cache and exit.")
     ap.add_argument("--verbose", type=int, default=None, help="Override WOS_VERBOSE (0..3).")
@@ -1710,6 +1939,68 @@ def main():
     conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
     create_temp_view(conn)
 
+    # Optional cache warming pass
+    if args.warm_cache or args.warm_only:
+        warm_cache(
+            conn=conn,
+            start=args.start,
+            end=args.end,
+            interval=args.interval,
+            intraday_limit_days=int(args.intraday_limit_days),
+        )
+        if args.warm_only:
+            return
+
+    # --------------------------------------------
+    # Mode 1: Backtest from saved GA genes
+    # --------------------------------------------
+    if getattr(args, "use_best", False):
+        genes_path = getattr(args, "genes_file", str(PORTFOLIO_DIR / "best_genes.json"))
+        try:
+            genes = load_genes_file(genes_path)
+        except Exception as exc:
+            print(f"❌ Failed to load genes from {genes_path}: {exc}")
+            sys.exit(3)
+
+        vprint(1, f"[RUN] Using genes file: {genes_path}")
+        res = run_backtest_from_genes(
+            conn=conn,
+            genes=genes,
+            start=args.start,
+            end=args.end,
+            initial_equity=args.initial_equity,
+            ticker_filter=args.ticker,
+            interval=args.interval,
+            intraday_limit_days=int(args.intraday_limit_days),
+        )
+        # If you want to honor extra SQL filter even in genes mode, re-run with sql_filter:
+        if args.sql_filter:
+            vprint(1, f"[RUN] Re-running with extra SQL filter: {args.sql_filter}")
+            # Convert genes→params/gates directly and call backtest to pass sql_filter through.
+            params = genes_to_params(genes)
+            gates  = genes_to_gates(genes)
+            res = backtest(
+                conn=conn,
+                params=params,
+                start=args.start,
+                end=args.end,
+                initial_equity=args.initial_equity,
+                ticker_filter=args.ticker,
+                sql_filter=args.sql_filter,
+                gates=gates,
+                interval=args.interval,
+                intraday_limit_days=args.intraday_limit_days,
+            )
+            print("\n[BT] Metrics:")
+            print(json.dumps(res.get("metrics", {}), indent=2))
+            if res.get("trades_csv"):
+                print("[BT] Trades CSV:", res["trades_csv"])
+            print("[BT] Done.")
+        return
+
+    # --------------------------------------------
+    # Mode 2: GA Optimization
+    # --------------------------------------------
     if args.ga:
         # GA run with default weights
         weights = _default_weights()
@@ -1739,30 +2030,34 @@ def main():
         print("[GA] Best metrics saved to:", PORTFOLIO_DIR / "best_metrics.json")
         print("[GA] Log CSV:", PORTFOLIO_DIR / "ga_log.csv")
         print("[GA] Done.")
-    else:
-        # Single backtest with stock defaults (no GA)
-        print("[BT] Single-run backtest with default params & default council gates.")
-        params = StrategyParams()
-        gates = CouncilGates()
-        if args.sql_filter:
-            vprint(1, f"[BT] Extra SQL filter: {args.sql_filter}")
-        bt = backtest(
-            conn=conn,
-            params=params,
-            start=args.start,
-            end=args.end,
-            initial_equity=args.initial_equity,
-            ticker_filter=args.ticker,
-            sql_filter=args.sql_filter,
-            gates=gates,
-            interval=args.interval,
-            intraday_limit_days=args.intraday_limit_days,
-        )
-        print("\n[BT] Metrics:")
-        print(json.dumps(bt.get("metrics", {}), indent=2))
-        if bt.get("trades_csv"):
-            print("[BT] Trades CSV:", bt["trades_csv"])
-        print("[BT] Done.")
+        return
+
+    # --------------------------------------------
+    # Mode 3: Single backtest with stock defaults
+    # --------------------------------------------
+    print("[BT] Single-run backtest with default params & default council gates.")
+    params = StrategyParams()
+    gates = CouncilGates()
+    if args.sql_filter:
+        vprint(1, f"[BT] Extra SQL filter: {args.sql_filter}")
+    bt = backtest(
+        conn=conn,
+        params=params,
+        start=args.start,
+        end=args.end,
+        initial_equity=args.initial_equity,
+        ticker_filter=args.ticker,
+        sql_filter=args.sql_filter,
+        gates=gates,
+        interval=args.interval,
+        intraday_limit_days=args.intraday_limit_days,
+    )
+    print("\n[BT] Metrics:")
+    print(json.dumps(bt.get("metrics", {}), indent=2))
+    if bt.get("trades_csv"):
+        print("[BT] Trades CSV:", bt["trades_csv"])
+    print("[BT] Done.")
+
 
 if __name__ == "__main__":
     main()

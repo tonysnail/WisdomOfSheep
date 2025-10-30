@@ -1,0 +1,340 @@
+[BOOT] portfolio_probe starting — db=/Users/carlhudson/Documents/Coding/WisdomOfSheep/council/wisdom_of_sheep-backtest-Oct22.sql window=2025-09-20→2025-10-22 equity=100000.0
+[SQL] Creating TEMP VIEW chairman_flat_v3 …
+[BT] Single-run backtest with default params & default council gates.
+[BT] Rows: 772 | Window: 2025-09-20→2025-10-22 | Equity: 100000.00
+[RESOLVE] Loading enriched tickers: tickers/tickers_enriched.csv
+⚠️  Resolve failed: 'ASCX' → skip
+⚠️  Resolve failed: 'ATT' → skip
+⚠️  Resolve failed: 'AV' → skip
+⚠️  Resolve failed: 'AVNRL' → skip
+$BOCA: possibly delisted; no timezone found
+HTTP Error 404: {"quoteSummary":{"result":null,"error":{"code":"Not Found","description":"Quote not found for symbol: BOCA.L"}}}
+$BOCA.L: possibly delisted; no timezone found
+$BOCA.TO: possibly delisted; no timezone found
+$GPRX: possibly delisted; no timezone found
+$GPRX.L: possibly delisted; no timezone found
+$GPRX.TO: possibly delisted; no timezone found
+$GPRX.V: possibly delisted; no timezone found
+$GPRX.PA: possibly delisted; no timezone found
+$GPRX.AS: possibly delisted; no timezone found
+$GPRX.BR: possibly delisted; no timezone found
+$GPRX.DE: possibly delisted; no timezone found
+$GPRX.MI: possibly delisted; no timezone found
+$GPRX.MC: possibly delisted; no timezone found
+$GPRX.CO: possibly delisted; no timezone found
+$GPRX.ST: possibly delisted; no timezone found
+$GPRX.HE: possibly delisted; no timezone found
+$GPRX.OL: possibly delisted; no timezone found
+$GPRX.SW: possibly delisted; no timezone found
+$GPRX.AX: possibly delisted; no timezone found
+$GPRX.T: possibly delisted; no timezone found
+$GPRX.HK: possibly delisted; no timezone found
+$GPRX.NS: possibly delisted; no timezone found
+$GPRX.BO: possibly delisted; no timezone found
+$GPRX.KS: possibly delisted; no timezone found
+$GPRX.KQ: possibly delisted; no timezone found
+$GPRX.TW: possibly delisted; no timezone found
+$GPRX.TWO: possibly delisted; no timezone found
+$GPRX.SA: possibly delisted; no timezone found
+$GPRX.MX: possibly delisted; no timezone found
+[RESOLVE] Failed to resolve: GPRX
+⚠️  Resolve failed: 'GPRX' → skip
+$LEM: possibly delisted; no price data found  (1d 2025-09-20 00:00:00+00:00 -> 2025-10-22 00:00:00+00:00)
+$LEM.L: possibly delisted; no price data found  (1d 2025-09-20 00:00:00+00:00 -> 2025-10-22 00:00:00+00:00)
+$LEM.TO: possibly delisted; no timezone found
+$LME: possibly delisted; no price data found  (1d 2025-09-20 00:00:00+00:00 -> 2025-10-22 00:00:00+00:00)
+$LME.L: possibly delisted; no timezone found
+$LME.TO: possibly delisted; no timezone found
+$MINERALRITE: possibly delisted; no timezone found
+[RESOLVE] Failed to resolve: MINERALRITE
+⚠️  Resolve failed: 'MineralRite' → skip
+$NEW: possibly delisted; no timezone found
+$NEW.L: possibly delisted; no price data found  (1d 2025-09-20 00:00:00+00:00 -> 2025-10-22 00:00:00+00:00)
+$NEW.TO: possibly delisted; no price data found  (1d 2025-09-20 00:00:00+00:00 -> 2025-10-22 00:00:00+00:00)
+$NEW.V: possibly delisted; no timezone found
+$NEW.PA: possibly delisted; no timezone found
+$NEW.AS: possibly delisted; no timezone found
+$NEW.BR: possibly delisted; no timezone found
+$NEW.DE: possibly delisted; no timezone found
+$NEW.MI: possibly delisted; no timezone found
+$NEW.MC: possibly delisted; no timezone found
+$NEW.CO: possibly delisted; no timezone found
+$NEW.ST: possibly delisted; no timezone found
+$NEW.HE: possibly delisted; no timezone found
+$NEW.OL: possibly delisted; no timezone found
+$NEW.SW: possibly delisted; no timezone found
+$NEW.AX: possibly delisted; no timezone found
+$NEW.T: possibly delisted; no timezone found
+$NEW.HK: possibly delisted; no timezone found
+$NEW.NS: possibly delisted; no timezone found
+$NEW.BO: possibly delisted; no timezone found
+$NEW.KS: possibly delisted; no timezone found
+$NEW.KQ: possibly delisted; no timezone found
+$NEW.TW: possibly delisted; no timezone found
+$NEW.TWO: possibly delisted; no timezone found
+$NEW.SA: possibly delisted; no timezone found
+$NEW.MX: possibly delisted; no timezone found
+[RESOLVE] Failed to resolve: NEW
+⚠️  Resolve failed: 'NEW' → skip
+$NILI: possibly delisted; no timezone found
+$NILI.L: possibly delisted; no timezone found
+$NILI.TO: possibly delisted; no timezone found
+$NONE: possibly delisted; no timezone found
+$NONE.L: possibly delisted; no timezone found
+$NONE.TO: possibly delisted; no timezone found
+$NONE.V: possibly delisted; no timezone found
+$NONE.PA: possibly delisted; no timezone found
+$NONE.AS: possibly delisted; no timezone found
+$NONE.BR: possibly delisted; no timezone found
+$NONE.DE: possibly delisted; no timezone found
+$NONE.MI: possibly delisted; no timezone found
+$NONE.MC: possibly delisted; no timezone found
+$NONE.CO: possibly delisted; no timezone found
+$NONE.ST: possibly delisted; no timezone found
+$NONE.HE: possibly delisted; no timezone found
+$NONE.OL: possibly delisted; no timezone found
+$NONE.SW: possibly delisted; no timezone found
+$NONE.AX: possibly delisted; no timezone found
+$NONE.T: possibly delisted; no timezone found
+$NONE.HK: possibly delisted; no timezone found
+$NONE.NS: possibly delisted; no timezone found
+$NONE.BO: possibly delisted; no timezone found
+$NONE.KS: possibly delisted; no timezone found
+$NONE.KQ: possibly delisted; no timezone found
+$NONE.TW: possibly delisted; no timezone found
+$NONE.TWO: possibly delisted; no timezone found
+$NONE.SA: possibly delisted; no timezone found
+$NONE.MX: possibly delisted; no timezone found
+[RESOLVE] Failed to resolve: NONE
+⚠️  Resolve failed: 'NONE' → skip
+$NULL: possibly delisted; no timezone found
+$NULL.L: possibly delisted; no timezone found
+$NULL.TO: possibly delisted; no timezone found
+$NULL.V: possibly delisted; no timezone found
+$NULL.PA: possibly delisted; no timezone found
+$NULL.AS: possibly delisted; no timezone found
+$NULL.BR: possibly delisted; no timezone found
+$NULL.DE: possibly delisted; no timezone found
+$NULL.MI: possibly delisted; no timezone found
+$NULL.MC: possibly delisted; no timezone found
+$NULL.CO: possibly delisted; no timezone found
+$NULL.ST: possibly delisted; no timezone found
+$NULL.HE: possibly delisted; no timezone found
+$NULL.OL: possibly delisted; no timezone found
+$NULL.SW: possibly delisted; no timezone found
+$NULL.AX: possibly delisted; no timezone found
+$NULL.T: possibly delisted; no timezone found
+$NULL.HK: possibly delisted; no timezone found
+$NULL.NS: possibly delisted; no timezone found
+$NULL.BO: possibly delisted; no timezone found
+$NULL.KS: possibly delisted; no timezone found
+$NULL.KQ: possibly delisted; no timezone found
+$NULL.TW: possibly delisted; no timezone found
+$NULL.TWO: possibly delisted; no timezone found
+$NULL.SA: possibly delisted; no timezone found
+$NULL.MX: possibly delisted; no timezone found
+[RESOLVE] Failed to resolve: NULL
+⚠️  Resolve failed: 'NULL' → skip
+$OTCQX: possibly delisted; no price data found  (1d 2025-09-20 00:00:00+00:00 -> 2025-10-22 00:00:00+00:00)
+$OTCQX.L: possibly delisted; no timezone found
+$OTCQX.TO: possibly delisted; no timezone found
+$OTCQX.V: possibly delisted; no timezone found
+$OTCQX.PA: possibly delisted; no timezone found
+$OTCQX.AS: possibly delisted; no timezone found
+$OTCQX.BR: possibly delisted; no timezone found
+$OTCQX.DE: possibly delisted; no timezone found
+$OTCQX.MI: possibly delisted; no timezone found
+$OTCQX.MC: possibly delisted; no timezone found
+$OTCQX.CO: possibly delisted; no timezone found
+$OTCQX.ST: possibly delisted; no timezone found
+$OTCQX.HE: possibly delisted; no timezone found
+$OTCQX.OL: possibly delisted; no timezone found
+$OTCQX.SW: possibly delisted; no timezone found
+$OTCQX.AX: possibly delisted; no timezone found
+$OTCQX.T: possibly delisted; no timezone found
+$OTCQX.HK: possibly delisted; no timezone found
+$OTCQX.NS: possibly delisted; no timezone found
+$OTCQX.BO: possibly delisted; no timezone found
+$OTCQX.KS: possibly delisted; no timezone found
+$OTCQX.KQ: possibly delisted; no timezone found
+$OTCQX.TW: possibly delisted; no timezone found
+$OTCQX.TWO: possibly delisted; no timezone found
+$OTCQX.SA: possibly delisted; no timezone found
+$OTCQX.MX: possibly delisted; no timezone found
+[RESOLVE] Failed to resolve: OTCQX
+⚠️  Resolve failed: 'OTCQX' → skip
+$P: possibly delisted; no price data found  (1d 2025-09-20 00:00:00+00:00 -> 2025-10-22 00:00:00+00:00)
+$P.L: possibly delisted; no timezone found
+$P.TO: possibly delisted; no price data found  (1d 2025-09-20 00:00:00+00:00 -> 2025-10-22 00:00:00+00:00)
+$P.V: possibly delisted; no timezone found
+$P.PA: possibly delisted; no timezone found
+$P.AS: possibly delisted; no timezone found
+$P.BR: possibly delisted; no timezone found
+$P.DE: possibly delisted; no timezone found
+$P.MI: possibly delisted; no timezone found
+$P.MC: possibly delisted; no timezone found
+$P.CO: possibly delisted; no timezone found
+$P.ST: possibly delisted; no timezone found
+$P.HE: possibly delisted; no timezone found
+$P.OL: possibly delisted; no timezone found
+$P.SW: possibly delisted; no timezone found
+$P.AX: possibly delisted; no timezone found
+$P.T: possibly delisted; no timezone found
+$P.HK: possibly delisted; no timezone found
+$P.NS: possibly delisted; no timezone found
+$P.BO: possibly delisted; no timezone found
+$P.KS: possibly delisted; no timezone found
+$P.KQ: possibly delisted; no timezone found
+$P.TW: possibly delisted; no timezone found
+$P.TWO: possibly delisted; no timezone found
+$P.SA: possibly delisted; no timezone found
+$P.MX: possibly delisted; no timezone found
+[RESOLVE] Failed to resolve: P
+⚠️  Resolve failed: 'P' → skip
+$PNCF: possibly delisted; no timezone found
+$PNCF.L: possibly delisted; no timezone found
+$PNCF.TO: possibly delisted; no timezone found
+$PNCF.V: possibly delisted; no timezone found
+$PNCF.PA: possibly delisted; no timezone found
+$PNCF.AS: possibly delisted; no timezone found
+$PNCF.BR: possibly delisted; no timezone found
+$PNCF.DE: possibly delisted; no timezone found
+$PNCF.MI: possibly delisted; no timezone found
+$PNCF.MC: possibly delisted; no timezone found
+$PNCF.CO: possibly delisted; no timezone found
+$PNCF.ST: possibly delisted; no timezone found
+$PNCF.HE: possibly delisted; no timezone found
+$PNCF.OL: possibly delisted; no timezone found
+$PNCF.SW: possibly delisted; no timezone found
+$PNCF.AX: possibly delisted; no timezone found
+$PNCF.T: possibly delisted; no timezone found
+$PNCF.HK: possibly delisted; no timezone found
+$PNCF.NS: possibly delisted; no timezone found
+$PNCF.BO: possibly delisted; no timezone found
+$PNCF.KS: possibly delisted; no timezone found
+$PNCF.KQ: possibly delisted; no timezone found
+$PNCF.TW: possibly delisted; no timezone found
+$PNCF.TWO: possibly delisted; no timezone found
+$PNCF.SA: possibly delisted; no timezone found
+$PNCF.MX: possibly delisted; no timezone found
+[RESOLVE] Failed to resolve: PNCF
+⚠️  Resolve failed: 'PNCF' → skip
+$PNG: possibly delisted; no price data found  (1d 2025-09-20 00:00:00+00:00 -> 2025-10-22 00:00:00+00:00)
+$PNG.L: possibly delisted; no price data found  (1d 2025-09-20 00:00:00+00:00 -> 2025-10-22 00:00:00+00:00)
+$PNG.TO: possibly delisted; no price data found  (1d 2025-09-20 00:00:00+00:00 -> 2025-10-22 00:00:00+00:00)
+$SESAI: possibly delisted; no timezone found
+$SESAI.L: possibly delisted; no timezone found
+$SESAI.TO: possibly delisted; no timezone found
+$SESAI.V: possibly delisted; no timezone found
+$SESAI.PA: possibly delisted; no timezone found
+$SESAI.AS: possibly delisted; no timezone found
+$SESAI.BR: possibly delisted; no timezone found
+$SESAI.DE: possibly delisted; no timezone found
+$SESAI.MI: possibly delisted; no timezone found
+$SESAI.MC: possibly delisted; no timezone found
+$SESAI.CO: possibly delisted; no timezone found
+$SESAI.ST: possibly delisted; no timezone found
+$SESAI.HE: possibly delisted; no timezone found
+$SESAI.OL: possibly delisted; no timezone found
+$SESAI.SW: possibly delisted; no timezone found
+$SESAI.AX: possibly delisted; no timezone found
+$SESAI.T: possibly delisted; no timezone found
+$SESAI.HK: possibly delisted; no timezone found
+$SESAI.NS: possibly delisted; no timezone found
+$SESAI.BO: possibly delisted; no timezone found
+$SESAI.KS: possibly delisted; no timezone found
+$SESAI.KQ: possibly delisted; no timezone found
+$SESAI.TW: possibly delisted; no timezone found
+$SESAI.TWO: possibly delisted; no timezone found
+$SESAI.SA: possibly delisted; no timezone found
+$SESAI.MX: possibly delisted; no timezone found
+[RESOLVE] Failed to resolve: SESAI
+⚠️  Resolve failed: 'SESAI' → skip
+$SPX: possibly delisted; no price data found  (1d 2025-09-20 00:00:00+00:00 -> 2025-10-22 00:00:00+00:00)
+$TATA: possibly delisted; no timezone found
+$TATA.L: possibly delisted; no timezone found
+$TATA.TO: possibly delisted; no timezone found
+$TATA.V: possibly delisted; no timezone found
+$TATA.PA: possibly delisted; no timezone found
+$TATA.AS: possibly delisted; no timezone found
+$TATA.BR: possibly delisted; no timezone found
+$TATA.DE: possibly delisted; no timezone found
+$TATA.MI: possibly delisted; no timezone found
+$TATA.MC: possibly delisted; no timezone found
+$TATA.CO: possibly delisted; no timezone found
+$TATA.ST: possibly delisted; no timezone found
+$TATA.HE: possibly delisted; no timezone found
+$TATA.OL: possibly delisted; no timezone found
+$TATA.SW: possibly delisted; no timezone found
+$TATA.AX: possibly delisted; no timezone found
+$TATA.T: possibly delisted; no timezone found
+$TATA.HK: possibly delisted; no timezone found
+$TATA.NS: possibly delisted; no timezone found
+$TATA.BO: possibly delisted; no timezone found
+$TATA.KS: possibly delisted; no timezone found
+$TATA.KQ: possibly delisted; no timezone found
+$TATA.TW: possibly delisted; no timezone found
+$TATA.TWO: possibly delisted; no timezone found
+$TATA.SA: possibly delisted; no timezone found
+$TATA.MX: possibly delisted; no timezone found
+[RESOLVE] Failed to resolve: TATA
+⚠️  Resolve failed: 'TATA' → skip
+$TRUMP: possibly delisted; no timezone found
+$TRUMP.L: possibly delisted; no timezone found
+$TRUMP.TO: possibly delisted; no timezone found
+$TRUMP.V: possibly delisted; no timezone found
+$TRUMP.PA: possibly delisted; no timezone found
+$TRUMP.AS: possibly delisted; no timezone found
+$TRUMP.BR: possibly delisted; no timezone found
+$TRUMP.DE: possibly delisted; no timezone found
+$TRUMP.MI: possibly delisted; no timezone found
+$TRUMP.MC: possibly delisted; no timezone found
+$TRUMP.CO: possibly delisted; no timezone found
+$TRUMP.ST: possibly delisted; no timezone found
+$TRUMP.HE: possibly delisted; no timezone found
+$TRUMP.OL: possibly delisted; no timezone found
+$TRUMP.SW: possibly delisted; no timezone found
+$TRUMP.AX: possibly delisted; no timezone found
+$TRUMP.T: possibly delisted; no timezone found
+$TRUMP.HK: possibly delisted; no timezone found
+$TRUMP.NS: possibly delisted; no timezone found
+$TRUMP.BO: possibly delisted; no timezone found
+$TRUMP.KS: possibly delisted; no timezone found
+$TRUMP.KQ: possibly delisted; no timezone found
+$TRUMP.TW: possibly delisted; no timezone found
+$TRUMP.TWO: possibly delisted; no timezone found
+$TRUMP.SA: possibly delisted; no timezone found
+$TRUMP.MX: possibly delisted; no timezone found
+[RESOLVE] Failed to resolve: TRUMP
+⚠️  Resolve failed: 'TRUMP' → skip
+$TOTALENERGIES: possibly delisted; no timezone found
+[RESOLVE] Failed to resolve: TOTALENERGIES
+⚠️  Resolve failed: 'TotalEnergies' → skip
+
+Backtest summary
+  Trades: 68
+  Total PnL: 8,229.57
+  Win rate: 54.4%
+  Max drawdown: 2.2%
+  Trades CSV: /Users/carlhudson/Documents/Coding/WisdomOfSheep/portfolio/backtest_trades.csv
+
+[BT] Metrics:
+{
+  "trades": 68,
+  "total_pnl": 8229.56848118141,
+  "win_rate": 0.5441176470588235,
+  "cagr": 2.175367473555426,
+  "sharpe": 3.8626291674584685,
+  "sortino": 5.0,
+  "profit_factor": 1.9169302446653371,
+  "max_dd": 0.021608497097240643,
+  "calmar": 100.6718543990371,
+  "vol": 0.07648153142903581,
+  "expectancy": 121.02306589972662,
+  "end_equity": 108229.56848118138,
+  "mean_pretrade_score": 1.4298529411764707,
+  "watchout_hits": 0.029411764705882353,
+  "score": 1.9057206560842888
+}
+[BT] Trades CSV: /Users/carlhudson/Documents/Coding/WisdomOfSheep/portfolio/backtest_trades.csv
+[BT] Done.
