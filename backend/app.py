@@ -14,6 +14,7 @@ import sqlite3
 import csv
 import math
 import re
+import random
 import shutil
 import threading
 import time
@@ -24,6 +25,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Callable, Literal
 
+from urllib.parse import urljoin
+
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -33,6 +36,8 @@ from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from fastapi.encoders import jsonable_encoder
+
+import requests
 
 from backend.council_time import CouncilTimeModel, approximate_token_count
 
@@ -79,6 +84,27 @@ SCHEMA_PATH = ROOT / "council" / "council_schema.sql"
 TIME_MODEL_PATH = ROOT / "council" / "council_time_model.json"
 CSV_PATH = ROOT / "raw_posts_log.csv"
 TICKERS_DIR = ROOT / "tickers"  # <- your new folder
+
+
+DATA_DIR = ROOT / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+ORACLE_CURSOR_PATH = DATA_DIR / "oracle_cursor.json"
+ORACLE_DEFAULT_BASE_URL = (os.getenv("WOS_ORACLE_BASE_URL", "") or "").strip()
+ORACLE_USER = os.getenv("WOS_ORACLE_USER", "")
+ORACLE_PASS = os.getenv("WOS_ORACLE_PASS", "")
+ORACLE_BATCH_SIZE = max(1, _env_int("WOS_ORACLE_BATCH_SIZE", 32))
+_ORACLE_BATCH_SLEEP_RAW = _env_float("WOS_ORACLE_BATCH_SLEEP", 0.2)
+ORACLE_BATCH_SLEEP = 0.0 if _ORACLE_BATCH_SLEEP_RAW is None else max(0.0, _ORACLE_BATCH_SLEEP_RAW)
+_ORACLE_POLL_BASE_RAW = _env_float("WOS_ORACLE_POLL_BASE_SECONDS", 10.0)
+ORACLE_POLL_BASE = 10.0 if _ORACLE_POLL_BASE_RAW is None else max(1.0, _ORACLE_POLL_BASE_RAW)
+_ORACLE_POLL_MAX_RAW = _env_float("WOS_ORACLE_POLL_MAX_SECONDS", 60.0)
+ORACLE_POLL_MAX = 60.0 if _ORACLE_POLL_MAX_RAW is None else max(ORACLE_POLL_BASE, _ORACLE_POLL_MAX_RAW)
+_ORACLE_BACKOFF_MIN_RAW = _env_float("WOS_ORACLE_BACKOFF_MIN_SECONDS", 2.0)
+ORACLE_BACKOFF_MIN = 2.0 if _ORACLE_BACKOFF_MIN_RAW is None else max(0.5, _ORACLE_BACKOFF_MIN_RAW)
+_ORACLE_BACKOFF_MAX_RAW = _env_float("WOS_ORACLE_BACKOFF_MAX_SECONDS", 30.0)
+ORACLE_BACKOFF_MAX = 30.0 if _ORACLE_BACKOFF_MAX_RAW is None else max(ORACLE_BACKOFF_MIN, _ORACLE_BACKOFF_MAX_RAW)
+ORACLE_REQUEST_TIMEOUT = _env_float("WOS_ORACLE_TIMEOUT_SECONDS", 30.0)
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -1849,6 +1875,58 @@ def _job_increment(job_id: str, field: str, amount: int = 1) -> Optional[Dict[st
     return _job_mutate(job_id, mutate)
 
 
+def _default_oracle_cursor() -> Dict[str, str]:
+    return {"platform": "", "post_id": "", "scraped_at": ""}
+
+
+def _load_oracle_cursor() -> Dict[str, str]:
+    if not ORACLE_CURSOR_PATH.exists():
+        return _default_oracle_cursor()
+    try:
+        raw = json.loads(ORACLE_CURSOR_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return _default_oracle_cursor()
+        cursor = {
+            "platform": str(raw.get("platform", "") or ""),
+            "post_id": str(raw.get("post_id", "") or ""),
+            "scraped_at": str(raw.get("scraped_at", "") or ""),
+        }
+        return cursor
+    except Exception:
+        return _default_oracle_cursor()
+
+
+def _save_oracle_cursor(cursor: Dict[str, Any]) -> None:
+    payload = {
+        "platform": str(cursor.get("platform", "") or ""),
+        "post_id": str(cursor.get("post_id", "") or ""),
+        "scraped_at": str(cursor.get("scraped_at", "") or ""),
+    }
+    tmp_path = ORACLE_CURSOR_PATH.with_suffix(".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, ORACLE_CURSOR_PATH)
+
+
+def _oracle_auth_tuple() -> Optional[Tuple[str, str]]:
+    user = (ORACLE_USER or "").strip()
+    pwd = (ORACLE_PASS or "").strip()
+    if not (user and pwd):
+        return None
+    return user, pwd
+
+
+def _oracle_join(base_url: str, path: str) -> str:
+    base = (base_url or "").strip()
+    if not base:
+        return path
+    if not base.endswith("/"):
+        base = base + "/"
+    return urljoin(base, path.lstrip("/"))
+
+
 # =========================
 # Endpoints
 # =========================
@@ -1858,14 +1936,22 @@ def _worker_refresh_summaries(job_id: str):
     if not job:
         return
 
-    snap_path = Path(job["snapshot"])
+    snap_raw = job.get("snapshot")
+    snap_path = Path(snap_raw) if snap_raw else None
     backlog: List[Dict[str, Any]] = list(job.get("backlog") or [])
     only_new = bool(job.get("only_new"))
     collect_new_posts = bool(job.get("collect_new_posts"))
+    oracle_online = bool(job.get("oracle_online"))
+    oracle_base_url = str(job.get("oracle_base_url") or "").strip()
     backlog_total = len(backlog)
-    csv_total = int(job.get("csv_total") or max(int(job.get("total", 0)) - backlog_total, 0))
+    csv_total = int(job.get("csv_total") or 0)
     existing_posts: set[str] = set()
-    _job_update_fields(job_id, status="running", started_at=job.get("started_at") or time.time())
+    _job_update_fields(
+        job_id,
+        status="running",
+        started_at=job.get("started_at") or time.time(),
+        oracle_status=(job.get("oracle_status") if not oracle_online else "connecting"),
+    )
 
     def _ensure_not_cancelled() -> bool:
         current = _load_job(job_id)
@@ -1974,6 +2060,399 @@ def _worker_refresh_summaries(job_id: str):
             suffix = f" [{ticker}]" if ticker else ""
             _job_append_log(job_id, f"⚠ interest failed {pid}{suffix}: {reason}")
         return result
+
+    def _run_oracle_loop(conn: sqlite3.Connection, summarised: Set[str]) -> None:
+        if not oracle_base_url:
+            _job_append_log(job_id, "✗ Oracle base URL missing; cannot synchronise")
+            _job_update_fields(
+                job_id,
+                status="error",
+                error="oracle-base-url-missing",
+                phase="",
+                current="",
+                oracle_status="error",
+                ended_at=time.time(),
+            )
+            return
+
+        session = requests.Session()
+        auth_tuple = _oracle_auth_tuple()
+        if auth_tuple:
+            session.auth = auth_tuple
+        session.headers.update({"User-Agent": "WisdomOfSheep-OracleClient/1.0"})
+
+        timeout: Optional[float]
+        if ORACLE_REQUEST_TIMEOUT is None or ORACLE_REQUEST_TIMEOUT <= 0:
+            timeout = None
+        else:
+            timeout = ORACLE_REQUEST_TIMEOUT
+
+        def _handle_unauthorized() -> None:
+            _job_append_log(job_id, "✗ Oracle auth invalid. Set WOS_ORACLE_USER and WOS_ORACLE_PASS.")
+            _job_update_fields(
+                job_id,
+                status="error",
+                error="oracle-unauthorized",
+                oracle_status="unauthorized",
+                phase="",
+                current="",
+                oracle_poll_seconds=None,
+                oracle_idle_since=None,
+                ended_at=time.time(),
+            )
+
+        def _request(path: str, *, params: Optional[Dict[str, Any]] = None) -> Optional[requests.Response]:
+            backoff = ORACLE_BACKOFF_MIN
+            while _ensure_not_cancelled():
+                try:
+                    resp = session.get(
+                        _oracle_join(oracle_base_url, path),
+                        params=params,
+                        timeout=timeout,
+                    )
+                except requests.RequestException as exc:
+                    _job_append_log(job_id, f"⚠ Oracle request failed: {exc}")
+                    _job_update_fields(
+                        job_id,
+                        oracle_status="connecting",
+                        phase="Oracle request retry",
+                        current=str(exc),
+                    )
+                    time.sleep(min(backoff, ORACLE_BACKOFF_MAX))
+                    backoff = min(backoff * 2, ORACLE_BACKOFF_MAX)
+                    continue
+
+                if resp.status_code == 401:
+                    _handle_unauthorized()
+                    return None
+                if resp.status_code == 409:
+                    time.sleep(1.0)
+                    continue
+                if resp.status_code >= 500:
+                    _job_append_log(
+                        job_id,
+                        f"⚠ Oracle server error {resp.status_code}: {resp.text.strip()[:200]}",
+                    )
+                    time.sleep(min(backoff, ORACLE_BACKOFF_MAX))
+                    backoff = min(backoff * 2, ORACLE_BACKOFF_MAX)
+                    continue
+                if resp.status_code >= 400:
+                    _job_append_log(
+                        job_id,
+                        f"⚠ Oracle request {path} returned {resp.status_code}: {resp.text.strip()[:200]}",
+                    )
+                    time.sleep(min(backoff, ORACLE_BACKOFF_MAX))
+                    backoff = min(backoff * 2, ORACLE_BACKOFF_MAX)
+                    continue
+
+                return resp
+            return None
+
+        _job_update_fields(
+            job_id,
+            oracle_status="connecting",
+            phase="Oracle health check",
+            current="Connecting to Oracle…",
+            oracle_poll_seconds=None,
+            oracle_idle_since=None,
+        )
+
+        health_resp = _request("/healthz")
+        if health_resp is None:
+            return
+        if health_resp.status_code >= 400:
+            _job_append_log(job_id, f"✗ Oracle /healthz returned {health_resp.status_code}")
+            _job_update_fields(
+                job_id,
+                status="error",
+                error=f"oracle-healthz-{health_resp.status_code}",
+                oracle_status="error",
+                phase="",
+                current="",
+                oracle_poll_seconds=None,
+                oracle_idle_since=None,
+                ended_at=time.time(),
+            )
+            return
+
+        _job_update_fields(
+            job_id,
+            oracle_status="connecting",
+            phase="Oracle ready check",
+            current="Waiting for Oracle receiver…",
+            oracle_poll_seconds=None,
+            oracle_idle_since=None,
+        )
+
+        ready_backoff = max(2.0, ORACLE_BACKOFF_MIN)
+        while _ensure_not_cancelled():
+            ready_resp = _request("/wos/ready")
+            if ready_resp is None:
+                return
+            if ready_resp.status_code >= 400:
+                _job_append_log(job_id, f"✗ Oracle /wos/ready {ready_resp.status_code}")
+                _job_update_fields(
+                    job_id,
+                    status="error",
+                    error=f"oracle-ready-{ready_resp.status_code}",
+                    oracle_status="error",
+                    phase="",
+                    current="",
+                    oracle_poll_seconds=None,
+                    oracle_idle_since=None,
+                    ended_at=time.time(),
+                )
+                return
+            try:
+                ready_payload = ready_resp.json()
+            except Exception as exc:  # noqa: BLE001
+                _job_append_log(job_id, f"⚠ Oracle ready payload error: {exc}")
+                time.sleep(ready_backoff)
+                continue
+            if ready_payload.get("ready"):
+                break
+            _job_append_log(job_id, "Oracle busy, retrying ready check…")
+            time.sleep(ready_backoff)
+
+        _job_update_fields(
+            job_id,
+            oracle_status="warmup",
+            phase="Oracle warm-up scan",
+            current="Scanning for first unsummarised article…",
+            oracle_poll_seconds=None,
+            oracle_idle_since=None,
+        )
+
+        def _fetch_batch(ref_platform: Optional[str], ref_post_id: Optional[str], limit: int) -> Optional[List[Dict[str, Any]]]:
+            params: Dict[str, Any] = {"limit": max(1, limit)}
+            if ref_platform:
+                params["platform"] = ref_platform
+            if ref_post_id:
+                params["post_id"] = ref_post_id
+            resp = _request("/wos/next-strict", params=params)
+            if resp is None:
+                return None
+            try:
+                payload = resp.json()
+            except Exception as exc:  # noqa: BLE001
+                _job_append_log(job_id, f"⚠ Oracle next-strict parse error: {exc}")
+                return []
+            items = payload.get("items")
+            if not isinstance(items, list):
+                return []
+            return [item for item in items if isinstance(item, dict)]
+
+        last_processed: Optional[Dict[str, Any]] = None
+        pending_article: Optional[Dict[str, Any]] = None
+        ref_platform: Optional[str] = None
+        ref_post_id: Optional[str] = None
+
+        while _ensure_not_cancelled():
+            batch = _fetch_batch(ref_platform, ref_post_id, ORACLE_BATCH_SIZE)
+            if batch is None:
+                return
+            if not batch:
+                break
+            for article in batch:
+                pid = str(article.get("post_id") or "").strip()
+                if not pid:
+                    continue
+                if pid in summarised:
+                    last_processed = article
+                    ref_platform = str(article.get("platform") or "") or None
+                    ref_post_id = pid
+                    continue
+                pending_article = article
+                break
+            if pending_article:
+                break
+            tail = batch[-1]
+            ref_platform = str(tail.get("platform") or "") or None
+            ref_post_id = str(tail.get("post_id") or "") or None
+            if ORACLE_BATCH_SLEEP > 0:
+                time.sleep(ORACLE_BATCH_SLEEP)
+
+        cursor_state = _default_oracle_cursor()
+        if last_processed:
+            cursor_state = {
+                "platform": str(last_processed.get("platform") or ""),
+                "post_id": str(last_processed.get("post_id") or ""),
+                "scraped_at": str(last_processed.get("scraped_at") or ""),
+            }
+        _save_oracle_cursor(cursor_state)
+        _job_update_fields(job_id, oracle_cursor=cursor_state)
+
+        if pending_article is None:
+            # Nothing new to process yet; enter idle polling immediately.
+            ref_platform = cursor_state.get("platform") or None
+            ref_post_id = cursor_state.get("post_id") or None
+
+        poll_interval = ORACLE_POLL_BASE
+        idle_started: Optional[float] = None
+
+        def _normalize_article(article: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "platform": str(article.get("platform") or ""),
+                "post_id": str(article.get("post_id") or ""),
+                "scraped_at": str(article.get("scraped_at") or ""),
+                "source": str(article.get("source") or ""),
+                "title": str(article.get("title") or ""),
+            }
+
+        while _ensure_not_cancelled():
+            if pending_article is None:
+                batch = _fetch_batch(ref_platform, ref_post_id, 1)
+                if batch is None:
+                    return
+                if not batch:
+                    now = time.time()
+                    if idle_started is None:
+                        idle_started = now
+                    wait = min(poll_interval, ORACLE_POLL_MAX)
+                    jitter = wait * random.uniform(-0.2, 0.2)
+                    wait = max(1.0, wait + jitter)
+                    elapsed = now - idle_started
+                    last_desc = "last: (none)"
+                    if any(cursor_state.values()):
+                        last_desc = (
+                            f"last: {cursor_state.get('scraped_at') or ''} "
+                            f"{cursor_state.get('platform') or ''}:{cursor_state.get('post_id') or ''}"
+                        ).strip()
+                    _job_update_fields(
+                        job_id,
+                        oracle_status="idle",
+                        phase=f"Idle (polling every {wait:.1f}s)",
+                        current=f"Idle for {int(elapsed)}s — {last_desc}",
+                        oracle_poll_seconds=wait,
+                        oracle_idle_since=idle_started,
+                    )
+                    _job_append_log(
+                        job_id,
+                        f"No new articles on Oracle ({last_desc}). Polling again in {wait:.1f}s…",
+                    )
+                    time.sleep(wait)
+                    poll_interval = min(wait * 1.5, ORACLE_POLL_MAX)
+                    continue
+                pending_article = batch[0]
+                idle_started = None
+                poll_interval = ORACLE_POLL_BASE
+
+            details = _normalize_article(pending_article)
+            pid = details["post_id"]
+            title = details["title"]
+            scraped_at = details["scraped_at"]
+            platform = details["platform"]
+            source = details["source"]
+            display_title = title[:80]
+
+            _job_update_fields(
+                job_id,
+                oracle_status="processing",
+                phase="Oracle summarising",
+                current=f"{scraped_at} {platform}:{pid} — {display_title}",
+                oracle_poll_seconds=None,
+                oracle_idle_since=None,
+            )
+            _job_append_log(
+                job_id,
+                f"→ oracle summarising {scraped_at} {platform}:{pid} — {display_title}",
+            )
+
+            post_vals = {
+                "post_id": pid,
+                "platform": platform or None,
+                "source": source or None,
+                "url": pending_article.get("url"),
+                "title": title,
+                "author": pending_article.get("author"),
+                "scraped_at": scraped_at,
+                "posted_at": pending_article.get("posted_at") or scraped_at,
+                "score": (
+                    int(pending_article["score"])
+                    if str(pending_article.get("score") or "").isdigit()
+                    else None
+                ),
+                "text": pending_article.get("text"),
+            }
+            extras_vals = {
+                "final_url": pending_article.get("final_url"),
+                "fetch_status": pending_article.get("fetch_status"),
+                "domain": pending_article.get("domain"),
+            }
+
+            _upsert_post_row(conn, post_vals)
+            _upsert_extras(conn, pid, extras_vals)
+
+            if only_new:
+                existing_posts.add(pid)
+
+            code = 0
+            while _ensure_not_cancelled():
+                code = _stream_summariser(pid, title)
+                if code == 0:
+                    break
+                _job_append_log(job_id, f"✗ summariser exit {code} for {pid}; retrying in 5s")
+                time.sleep(5)
+            if code != 0:
+                pending_article = None
+                continue
+
+            summarised.add(pid)
+            _job_append_log(
+                job_id,
+                f"✓ summarised {scraped_at} {platform}:{pid} — {display_title}",
+            )
+
+            try:
+                convo_payload = _ingest_conversation_hub(conn, pid)
+                if convo_payload:
+                    tickers_txt = ",".join(convo_payload.get("tickers") or [])
+                    if tickers_txt:
+                        _job_append_log(job_id, f"✓ convo hub {pid} [{tickers_txt}]")
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("conversation hub ingest failed for oracle %s", pid)
+                _job_append_log(job_id, f"✗ convo hub failed {pid}: {exc}")
+
+            interest_result = None
+            try:
+                if _should_run_interest(conn, pid):
+                    _interest_schedule(1)
+                    _interest_before_run("Interest oracle", pid, title)
+                    interest_result = _run_interest_for_post(pid, title)
+                    _interest_after_run()
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("interest scoring check failed for oracle %s", pid)
+                _job_append_log(job_id, f"⚠ interest check failed {pid}: {exc}")
+
+            interest_score_val: Optional[float] = None
+            if interest_result is not None:
+                raw_score = interest_result.get("interest_score")
+                try:
+                    interest_score_val = float(raw_score) if raw_score is not None else None
+                except (TypeError, ValueError):
+                    interest_score_val = None
+            _record_new_post(pid, title, interest_score_val)
+
+            _job_increment(job_id, "done", 1)
+
+            cursor_state = {
+                "platform": platform,
+                "post_id": pid,
+                "scraped_at": scraped_at,
+            }
+            _save_oracle_cursor(cursor_state)
+            _job_update_fields(
+                job_id,
+                oracle_cursor=cursor_state,
+                oracle_poll_seconds=None,
+                oracle_idle_since=None,
+            )
+
+            ref_platform = platform or None
+            ref_post_id = pid or None
+            pending_article = None
+
+        # Cancellation or termination handled by outer caller.
 
     def _record_new_post(pid: str, title: str, interest_score: Optional[float]) -> None:
         if not collect_new_posts:
@@ -2148,6 +2627,11 @@ def _worker_refresh_summaries(job_id: str):
             rows = _q_all(conn, "SELECT DISTINCT post_id FROM stages WHERE stage = 'summariser'", tuple())
             summarised.update(row["post_id"] for row in rows)
 
+            if oracle_online:
+                _job_update_fields(job_id, oracle_status="warmup")
+                _run_oracle_loop(conn, summarised)
+                return
+
             seen_csv: set[str] = set()
 
             if backlog:
@@ -2260,10 +2744,11 @@ def _worker_refresh_summaries(job_id: str):
     except Exception as ex:
         _job_update_fields(job_id, status="error", error=str(ex), ended_at=time.time())
     finally:
-        try:
-            snap_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if snap_path is not None:
+            try:
+                snap_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         with JOB_INDEX_LOCK:
             if ACTIVE_JOB_ID == job_id:
                 ACTIVE_JOB_ID = None
@@ -3329,6 +3814,8 @@ def clear_post_analysis(post_id: str):
 class RefreshSummariesStartRequest(BaseModel):
     mode: Literal["full", "new_only"] = "full"
     collect_new_posts: bool = False
+    oracle_online: bool = False
+    oracle_base_url: Optional[str] = None
 
 
 @app.post("/api/refresh-summaries/start")
@@ -3340,7 +3827,16 @@ def start_refresh_summaries(
     Returns a job_id; poll /api/refresh-summaries/{job_id} for progress.
     """
     global ACTIVE_JOB_ID
-    if not CSV_PATH.exists():
+
+    requested_mode = payload.mode if payload else "full"
+    only_new = requested_mode == "new_only"
+    collect_new_posts = bool(payload.collect_new_posts) if payload else False
+    oracle_online = bool(payload.oracle_online) if payload else False
+    oracle_base_url = (payload.oracle_base_url or ORACLE_DEFAULT_BASE_URL).strip() if payload else ORACLE_DEFAULT_BASE_URL
+    if oracle_online and not oracle_base_url:
+        raise HTTPException(status_code=400, detail="oracle-base-url-required")
+
+    if not oracle_online and not CSV_PATH.exists():
         raise HTTPException(status_code=404, detail="csv-not-found")
 
     job_id = str(uuid.uuid4())
@@ -3353,19 +3849,22 @@ def start_refresh_summaries(
             ACTIVE_JOB_ID = None
         ACTIVE_JOB_ID = job_id
 
-    snapshot_path = CSV_PATH.with_suffix(f".snapshot-{int(time.time())}.csv")
-
-    try:
-        shutil.copyfile(CSV_PATH, snapshot_path)
-    except Exception as ex:
-        with JOB_INDEX_LOCK:
-            if ACTIVE_JOB_ID == job_id:
-                ACTIVE_JOB_ID = None
-        raise HTTPException(status_code=500, detail=f"snapshot-failed: {ex}")
-
-    requested_mode = payload.mode if payload else "full"
-    only_new = requested_mode == "new_only"
-    collect_new_posts = bool(payload.collect_new_posts) if payload else False
+    snapshot_path: Optional[Path] = None
+    if not oracle_online:
+        snapshot_path = CSV_PATH.with_suffix(f".snapshot-{int(time.time())}.csv")
+        try:
+            shutil.copyfile(CSV_PATH, snapshot_path)
+        except Exception as ex:
+            with JOB_INDEX_LOCK:
+                if ACTIVE_JOB_ID == job_id:
+                    ACTIVE_JOB_ID = None
+            raise HTTPException(status_code=500, detail=f"snapshot-failed: {ex}")
+    else:
+        try:
+            if not ORACLE_CURSOR_PATH.exists():
+                _save_oracle_cursor(_default_oracle_cursor())
+        except Exception:
+            pass
 
     backlog: List[Dict[str, Any]] = []
     summarised_ids: set[str] = set()
@@ -3411,45 +3910,47 @@ def start_refresh_summaries(
         with JOB_INDEX_LOCK:
             if ACTIVE_JOB_ID == job_id:
                 ACTIVE_JOB_ID = None
-        try:
-            snapshot_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if snapshot_path is not None:
+            try:
+                snapshot_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         raise HTTPException(status_code=500, detail=f"db-prepare-failed: {ex}")
 
     backlog_ids = {item["post_id"] for item in backlog}
     total_backlog = len(backlog_ids)
     csv_total = 0
-    csv_seen: set[str] = set()
-    try:
-        with snapshot_path.open("r", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                pid = (row.get("post_id") or "").strip()
-                if not pid or pid in csv_seen:
-                    continue
-                csv_seen.add(pid)
-                if pid in summarised_ids or pid in backlog_ids:
-                    continue
-                if only_new and pid in existing_post_ids:
-                    continue
-                csv_total += 1
-    except Exception as ex:
-        with JOB_INDEX_LOCK:
-            if ACTIVE_JOB_ID == job_id:
-                ACTIVE_JOB_ID = None
+    if snapshot_path is not None:
+        csv_seen: set[str] = set()
         try:
-            snapshot_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise HTTPException(status_code=500, detail=f"snapshot-read-failed: {ex}")
+            with snapshot_path.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    pid = (row.get("post_id") or "").strip()
+                    if not pid or pid in csv_seen:
+                        continue
+                    csv_seen.add(pid)
+                    if pid in summarised_ids or pid in backlog_ids:
+                        continue
+                    if only_new and pid in existing_post_ids:
+                        continue
+                    csv_total += 1
+        except Exception as ex:
+            with JOB_INDEX_LOCK:
+                if ACTIVE_JOB_ID == job_id:
+                    ACTIVE_JOB_ID = None
+            try:
+                snapshot_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail=f"snapshot-read-failed: {ex}")
 
     total = total_backlog + csv_total
     now = time.time()
-    job = {
+    job: Dict[str, Any] = {
         "id": job_id,
-        "status": "queued",         # queued | running | done | error | cancelled
-        "snapshot": str(snapshot_path),
+        "status": "queued",  # queued | running | done | error | cancelled
+        "snapshot": str(snapshot_path) if snapshot_path is not None else None,
         "backlog": backlog,
         "mode": requested_mode,
         "only_new": only_new,
@@ -3458,8 +3959,8 @@ def start_refresh_summaries(
         "total": total,
         "done": 0,
         "current": "",
-        "phase": "",                # "processing"/"summarising"
-        "log_tail": [],             # last N lines
+        "phase": "",
+        "log_tail": [],
         "error": "",
         "started_at": None,
         "ended_at": None,
@@ -3467,10 +3968,17 @@ def start_refresh_summaries(
         "created_at": now,
         "updated_at": now,
         "new_posts": [],
+        "oracle_online": oracle_online,
+        "oracle_base_url": oracle_base_url,
+        "oracle_status": "connecting" if oracle_online else "offline",
+        "oracle_cursor": _load_oracle_cursor() if oracle_online else None,
+        "oracle_poll_seconds": None,
+        "oracle_idle_since": None,
     }
     _job_save(job)
 
-    t = threading.Thread(target=_worker_refresh_summaries, args=(job_id,), daemon=True)
+    worker = _worker_refresh_summaries
+    t = threading.Thread(target=worker, args=(job_id,), daemon=True)
     t.start()
 
     return {"ok": True, "job_id": job_id, "total": total}
