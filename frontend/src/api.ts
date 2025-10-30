@@ -245,6 +245,10 @@ export type RefreshJob = {
   } | null
   oracle_poll_seconds?: number | null
   oracle_idle_since?: number | null
+  oracle_progress_total?: number | null
+  oracle_progress_index?: number | null
+  oracle_progress_stage?: string | null
+  oracle_progress_message?: string | null
 }
 
 export async function getRefreshJob(jobId: string): Promise<RefreshJob> {
