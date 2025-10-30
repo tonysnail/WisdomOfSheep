@@ -165,7 +165,6 @@ const describePercent = (value?: number | null) => {
 
 export default function PostDetailView({
   detail,
-  onSummarise,
   onAnalyse,
   onClear,
   onClose,
@@ -178,7 +177,6 @@ export default function PostDetailView({
   technical,
 }: {
   detail: PostDetail
-  onSummarise: () => Promise<void>
   onAnalyse: () => Promise<void>
   onClear: () => Promise<void>
   onClose: () => void
@@ -459,10 +457,6 @@ export default function PostDetailView({
     onClose()
   }
 
-  const handleSummarise = () => {
-    if (!controlsDisabled) void onSummarise()
-  }
-
   const handleAnalyse = () => {
     if (!controlsDisabled) void onAnalyse()
   }
@@ -583,9 +577,6 @@ export default function PostDetailView({
       </div>
 
       <div className={buttonBarClass}>
-        <button type="button" className="detail-action-button" onClick={handleSummarise} disabled={controlsDisabled}>
-          Summarise Article
-        </button>
         <button type="button" className="detail-action-button" onClick={handleAnalyse} disabled={controlsDisabled}>
           Analyse Post
         </button>

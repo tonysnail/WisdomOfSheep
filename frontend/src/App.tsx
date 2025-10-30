@@ -5,7 +5,6 @@ import {
   runStage,
   runResearch,
   clearAnalysis,
-  eraseAllCouncilAnalysis,
   startRefreshSummaries,
   getRefreshJob,
   getActiveRefreshJob,
@@ -72,7 +71,6 @@ const STORAGE_KEYS = {
   postsPage: 'wos.postsPage',
   interestMin: 'wos.interestMin',
   councilJob: 'wos.councilJobId',
-  councilPrimed: 'wos.councilPrimedMissing',
   analyseNewActive: 'wos.analyseNewActive',
   analyseNewThreshold: 'wos.analyseNewThreshold',
   oracleOnline: 'wos.oracleOnline',
@@ -170,10 +168,6 @@ export default function App() {
   const [councilLogEntry, setCouncilLogEntry] = useState('')
   const [councilLog, setCouncilLog] = useState<string>('')
   const [councilCopyStatus, setCouncilCopyStatus] = useState<'idle' | 'copied' | 'failed'>('idle')
-  const [councilPrimed, setCouncilPrimed] = useState<boolean>(() => {
-    if (typeof window === 'undefined') return false
-    return window.localStorage.getItem(STORAGE_KEYS.councilPrimed) === '1'
-  })
   const [analyseNewActive, setAnalyseNewActive] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false
     return window.localStorage.getItem(STORAGE_KEYS.analyseNewActive) === '1'
@@ -245,15 +239,6 @@ export default function App() {
     if (typeof window === 'undefined') return
     window.localStorage.setItem(STORAGE_KEYS.interestMin, String(interestFilter))
   }, [interestFilter])
-
-  useEffect(() => {
-    if (typeof window === 'undefined') return
-    if (councilPrimed) {
-      window.localStorage.setItem(STORAGE_KEYS.councilPrimed, '1')
-    } else {
-      window.localStorage.removeItem(STORAGE_KEYS.councilPrimed)
-    }
-  }, [councilPrimed])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -1287,68 +1272,6 @@ export default function App() {
     }
   }
 
-  async function onEraseAllCouncilAnalysis() {
-    if (working || councilJobActive || councilJobBusy) return
-    if (typeof window !== 'undefined') {
-      const confirmErase = window.confirm(
-        'This will erase all stored council analysis results. Summaries will remain. Continue?',
-      )
-      if (!confirmErase) return
-    }
-
-    setBusy(true)
-    updateLog('')
-    try {
-      const res = await eraseAllCouncilAnalysis()
-      updateLog(`Erase all council analysis: ${JSON.stringify(res)}`)
-      const [listRes, detailRes] = await Promise.all([
-        listPosts(queryKey),
-        pickedId ? getPost(pickedId) : Promise.resolve<PostDetail | null>(null),
-      ])
-      setList(listRes)
-      if (detailRes) {
-        setDetail(detailRes)
-      }
-    } catch (e: any) {
-      updateLog(`Erase council analysis error: ${e.message}`)
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  async function onRefreshSummaries() {
-    updateLog('')
-    setRefreshJob(null)
-    setJobBusy(true)
-    try {
-      const start = await startRefreshSummaries()
-      setRefreshJobId(start.job_id)
-      if (start.conflict) {
-        updateLog((prev) => prev || 'A refresh job is already running.')
-      }
-    } catch (e: any) {
-      setJobBusy(false)
-      updateLog(`Start error: ${e.message}`)
-    }
-  }
-
-  async function onSummariseNewArticles() {
-    if (jobActive) return
-    updateLog('')
-    setRefreshJob(null)
-    setJobBusy(true)
-    try {
-      const start = await startRefreshSummaries({ mode: 'new_only' })
-      setRefreshJobId(start.job_id)
-      if (start.conflict) {
-        updateLog((prev) => prev || 'A refresh job is already running.')
-      }
-    } catch (e: any) {
-      setJobBusy(false)
-      updateLog(`Start error: ${e.message}`)
-    }
-  }
-
   async function handleAnalyseNewToggle(next: boolean) {
     if (next) {
       if (working || jobActive || councilJobActive || councilJobBusy) {
@@ -1416,72 +1339,10 @@ export default function App() {
     }
   }
 
-  async function onStopRefreshSummaries() {
-    if (!refreshJobId) return
-    try {
-      await stopRefreshJob(refreshJobId)
-    } catch (e: any) {
-      updateLog(`Stop error: ${e.message}`)
-    }
-  }
-
   const handleInterestThresholdChange = (value: number) => {
     const bounded = Math.max(0, Math.min(100, value))
     setInterestFilter(bounded)
     setPage(1)
-  }
-
-  async function onStartCouncilProcessing() {
-    try {
-      const repairMissing = !councilPrimed
-      const res = await startCouncilAnalysis({
-        interest_min: interestFilter,
-        repair_missing: repairMissing,
-      })
-      setCouncilJobId(res.job_id)
-      if (!res.conflict) {
-        setCouncilLog('')
-        setCouncilLogEntry('')
-        setCouncilCopyStatus('idle')
-        setCouncilJob({
-          id: res.job_id,
-          status: res.total > 0 ? 'queued' : 'done',
-          total: res.total,
-          done: 0,
-          remaining: res.total,
-          interest_min: res.interest_min,
-          repairs_total: res.repairs_total ?? 0,
-          repairs_done: 0,
-          log_tail: [],
-          message: '',
-          error: undefined,
-          current_eta_seconds: null,
-          current_started_at: null,
-          current_mode: null,
-          current_article_tokens: null,
-          current_summary_tokens: null,
-        })
-        setCouncilJobBusy(res.total > 0)
-        if (repairMissing && !councilPrimed) {
-          setCouncilPrimed(true)
-        }
-      } else {
-        setCouncilJobBusy(true)
-        setCouncilLogEntry((prev) => prev || 'Council analysis already running.')
-        updateLog((prev) => prev || 'Council analysis already running.')
-      }
-    } catch (e: any) {
-      updateLog(`Council start error: ${e.message}`)
-    }
-  }
-
-  async function onStopCouncilProcessing() {
-    if (!councilJobId) return
-    try {
-      await stopCouncilJob(councilJobId)
-    } catch (e: any) {
-      updateLog(`Council stop error: ${e.message}`)
-    }
   }
 
   async function onAnalyseSelected() {
@@ -1575,24 +1436,6 @@ export default function App() {
     }
   }
 
-  async function onSummariseArticle() {
-    if (!pickedId) return
-    const stages = ['entity', 'summariser', 'claims', 'context', 'for', 'against', 'direction']
-    setBusy(true)
-    updateLog('Summarisation started.')
-    try {
-      const res = await runStage({ post_id: pickedId, stages, overwrite: true })
-      logRunOutput(stages, res.stdout ?? '', res.stderr ?? '')
-      const [detailRes, listRes] = await Promise.all([getPost(pickedId), listPosts(queryKey)])
-      setDetail(detailRes)
-      setList(listRes)
-    } catch (e: any) {
-      updateLog(`Summarise error: ${e.message}`)
-    } finally {
-      setBusy(false)
-    }
-  }
-
   const handleCloseDetail = () => {
     setPickedId(null)
     setDetail(null)
@@ -1669,16 +1512,6 @@ export default function App() {
 
       <div className="toolbar">
         <div className="toolbar-row toolbar-primary">
-          <button
-            onClick={jobActive ? onStopRefreshSummaries : onRefreshSummaries}
-            disabled={(!jobActive && working) || analyseNewActive}
-          >
-            {jobActive ? 'Stop Refresh' : 'Summarise and Backfill'}
-          </button>
-          <button onClick={onSummariseNewArticles} disabled={jobActive || working || analyseNewActive}>
-            Summarise New Articles
-          </button>
-
           <div className="progress" title={`${batchDone}/${batchTotal}`}>
             <div style={{ width: `${progressPct}%` }} />
           </div>
@@ -1696,22 +1529,6 @@ export default function App() {
         </div>
 
         <div className="toolbar-row toolbar-council">
-          <label className={`toolbar-toggle${councilJobActive ? ' active' : ''}`}>
-            <input
-              type="checkbox"
-              checked={councilJobActive}
-              onChange={(event) => {
-                if (event.target.checked) {
-                  if (!councilJobActive) onStartCouncilProcessing()
-                } else if (councilJobActive) {
-                  onStopCouncilProcessing()
-                }
-              }}
-              disabled={analyseNewActive || working || councilJobBusy}
-            />
-            <span className="toolbar-toggle-track" />
-            <span className="toolbar-toggle-label">Council Analysis</span>
-          </label>
           <div className="toolbar-progress-group">
             <div className="council-progress-pair">
               <div className="council-progress-block">
@@ -1753,15 +1570,6 @@ export default function App() {
               </div>
             </div>
           </div>
-          <button
-            type="button"
-            className="toolbar-danger"
-            onClick={onEraseAllCouncilAnalysis}
-            disabled={working || councilJobActive || councilJobBusy || analyseNewActive}
-            title="Remove council analysis outputs for all posts"
-          >
-            Erase all Council Analysis
-          </button>
         </div>
 
         <div className="toolbar-row toolbar-analyse-new">
@@ -1860,7 +1668,6 @@ export default function App() {
           {detail && (
             <PostDetailView
               detail={detail}
-              onSummarise={onSummariseArticle}
               onAnalyse={onAnalyseSelected}
               onClear={onClearAnalysis}
               onClose={handleCloseDetail}
