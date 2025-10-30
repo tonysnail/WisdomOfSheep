@@ -18,6 +18,7 @@ def temp_db(tmp_path, monkeypatch):
     finally:
         conn.close()
     monkeypatch.setattr(backend_app, "DB_PATH", db_path)
+    monkeypatch.setattr(backend_app, "_DB_READY_PATH", None, raising=False)
     return db_path
 
 

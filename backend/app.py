@@ -74,6 +74,8 @@ except Exception as exc:  # noqa: BLE001
 # =========================
 LOGGER = logging.getLogger(__name__)
 DB_PATH = ROOT / "council" / "wisdom_of_sheep.sql"
+DB_TEMPLATE_PATH = ROOT / "council" / "wisdom_of_sheep-empty.sql"
+SCHEMA_PATH = ROOT / "council" / "council_schema.sql"
 TIME_MODEL_PATH = ROOT / "council" / "council_time_model.json"
 CSV_PATH = ROOT / "raw_posts_log.csv"
 TICKERS_DIR = ROOT / "tickers"  # <- your new folder
@@ -81,6 +83,92 @@ TICKERS_DIR = ROOT / "tickers"  # <- your new folder
 
 def _env_flag(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() not in {"", "0", "false", "no"}
+
+
+def _handle_wal_files(base_path: Path, dest_base: Path | None) -> None:
+    for suffix in ("-wal", "-shm"):
+        candidate = base_path.with_name(f"{base_path.name}{suffix}")
+        if not candidate.exists():
+            continue
+        try:
+            if dest_base is not None:
+                dest = dest_base.with_name(f"{dest_base.name}{suffix}")
+                shutil.move(str(candidate), str(dest))
+            else:
+                candidate.unlink()
+        except OSError:
+            continue
+
+
+def _read_schema() -> str:
+    if not SCHEMA_PATH.exists():
+        raise RuntimeError(f"Missing council schema at {SCHEMA_PATH}")
+    return SCHEMA_PATH.read_text(encoding="utf-8")
+
+
+def _initialize_db_file(target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _handle_wal_files(target, None)
+    if target.exists():
+        target.unlink()
+
+    if target == DB_PATH and DB_TEMPLATE_PATH.exists():
+        shutil.copyfile(DB_TEMPLATE_PATH, target)
+    else:
+        schema_sql = _read_schema()
+        with sqlite3.connect(str(target)) as conn:
+            conn.executescript(schema_sql)
+            conn.commit()
+
+
+def _is_db_healthy(path: Path) -> bool:
+    try:
+        with sqlite3.connect(str(path)) as conn:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+    except sqlite3.DatabaseError:
+        return False
+    if not row:
+        return False
+    return str(row[0]).strip().lower() == "ok"
+
+
+def _backup_corrupt_db(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    backup = path.with_name(f"{path.stem}.corrupt-{timestamp}{path.suffix}")
+    shutil.move(str(path), str(backup))
+    _handle_wal_files(path, backup)
+    return backup
+
+
+_DB_READY_LOCK = threading.Lock()
+_DB_READY_PATH: Path | None = None
+
+
+def _ensure_database_ready() -> None:
+    global _DB_READY_PATH
+    current = Path(DB_PATH)
+    if _DB_READY_PATH is not None and _DB_READY_PATH == current:
+        return
+
+    with _DB_READY_LOCK:
+        if _DB_READY_PATH is not None and _DB_READY_PATH == current:
+            return
+
+        current.parent.mkdir(parents=True, exist_ok=True)
+        if not current.exists():
+            LOGGER.warning("council database missing at %s; creating new file", current)
+            _initialize_db_file(current)
+        elif not _is_db_healthy(current):
+            backup = _backup_corrupt_db(current)
+            if backup is not None:
+                LOGGER.error("council database at %s was corrupt; backed up to %s and reinitialised", current, backup)
+            else:
+                LOGGER.error("council database at %s was corrupt; reinitialising", current)
+            _initialize_db_file(current)
+
+        _DB_READY_PATH = current
 
 
 def _env_int(name: str, default: int) -> int:
@@ -212,6 +300,7 @@ app.add_middleware(
 @app.on_event("startup")
 def _startup_init() -> None:
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_database_ready()
     with _connect() as conn:
         _ensure_schema(conn)
 
@@ -219,6 +308,7 @@ def _startup_init() -> None:
 # DB helpers
 # =========================
 def _connect() -> sqlite3.Connection:
+    _ensure_database_ready()
     if not DB_PATH.exists():
         raise RuntimeError(f"DB not found: {DB_PATH}")
     conn = sqlite3.connect(str(DB_PATH))
