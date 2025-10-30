@@ -2224,11 +2224,11 @@ def _worker_refresh_summaries(job_id: str):
         )
 
         def _fetch_batch(ref_platform: Optional[str], ref_post_id: Optional[str], limit: int) -> Optional[List[Dict[str, Any]]]:
-            params: Dict[str, Any] = {"limit": max(1, limit)}
-            if ref_platform:
-                params["platform"] = ref_platform
-            if ref_post_id:
-                params["post_id"] = ref_post_id
+            params: Dict[str, Any] = {
+                "limit": max(1, limit),
+                "platform": ref_platform or "",
+                "post_id": ref_post_id or "",
+            }
             resp = _request("/wos/next-strict", params=params)
             if resp is None:
                 return None
