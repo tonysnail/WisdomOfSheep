@@ -32,6 +32,9 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+COUNCIL_FAILURE_LOG = ROOT / "council_failures.log"
+COUNCIL_FAILURE_LOG_LOCK = threading.Lock()
+
 from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -1814,6 +1817,30 @@ class _CallbackWriter(io.TextIOBase):
         self._buffer = ""
 
 
+def _record_council_failure(
+    stage: str,
+    post_id: str,
+    title: str,
+    details: str,
+    *,
+    context: Optional[str] = None,
+) -> None:
+    safe_details = (details or "").replace("\n", " ").strip()
+    entry = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "stage": stage,
+        "post_id": post_id,
+        "title": title,
+        "details": safe_details,
+    }
+    if context:
+        entry["context"] = context
+    with COUNCIL_FAILURE_LOG_LOCK:
+        COUNCIL_FAILURE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with COUNCIL_FAILURE_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
 # =========================
 # Job helpers
 # =========================
@@ -2386,14 +2413,22 @@ def _worker_refresh_summaries(job_id: str):
             if only_new:
                 existing_posts.add(pid)
 
-            code = 0
-            while _ensure_not_cancelled():
-                code = _stream_summariser(pid, title)
-                if code == 0:
-                    break
-                _job_append_log(job_id, f"✗ summariser exit {code} for {pid}; retrying in 5s")
-                time.sleep(5)
-            if code != 0:
+            success, error_text, log_lines = _stream_summariser(pid, title)
+            if not success:
+                reason = error_text or (log_lines[-1] if log_lines else "Unknown summariser failure")
+                log_tail = "; ".join(log_lines[-5:]) if log_lines else ""
+                skip_message = f"✗ summariser failed {pid}; skipping"
+                _job_append_log(job_id, skip_message)
+                _record_council_failure(
+                    "summariser",
+                    pid,
+                    title,
+                    f"{reason}" if not log_tail else f"{reason} | log_tail={log_tail}",
+                    context=(
+                        f"scraped_at={scraped_at}, platform={platform}, source={source}, "
+                        f"display_title={display_title}"
+                    ),
+                )
                 pending_article = None
                 continue
 
@@ -2510,9 +2545,13 @@ def _worker_refresh_summaries(job_id: str):
             _run_interest_for_post(pid, title)
             _interest_after_run()
 
-    def _stream_summariser(post_id: str, title: str) -> int:
+    def _stream_summariser(post_id: str, title: str) -> Tuple[bool, Optional[str], List[str]]:
+        log_lines: List[str] = []
+
         def emit(line: str) -> None:
-            _job_append_log(job_id, line.rstrip("\r"))
+            clean_line = line.rstrip("\r")
+            log_lines.append(clean_line)
+            _job_append_log(job_id, clean_line)
 
         writer = _CallbackWriter(emit)
         try:
@@ -2531,11 +2570,12 @@ def _worker_refresh_summaries(job_id: str):
         except Exception as exc:
             writer.flush()
             logging.exception("summariser stage failed for %s", post_id)
-            emit(f"✗ summariser failed {post_id}: {exc}")
-            return 1
+            message = str(exc)
+            emit(f"✗ summariser failed {post_id}: {message}")
+            return False, message, log_lines
 
         writer.flush()
-        return 0
+        return True, None, log_lines
 
     try:
         try:
@@ -2589,8 +2629,8 @@ def _worker_refresh_summaries(job_id: str):
 
             _job_append_log(job_id, f"→ backlog summarising {pid}")
 
-            code = _stream_summariser(pid, title)
-            if code == 0:
+            success, error_text, log_lines = _stream_summariser(pid, title)
+            if success:
                 summarised.add(pid)
                 _job_append_log(job_id, f"✓ summarised backlog {pid}")
                 try:
@@ -2614,7 +2654,19 @@ def _worker_refresh_summaries(job_id: str):
                     logging.exception("interest scoring check failed for backlog %s", pid)
                     _job_append_log(job_id, f"⚠ interest backlog check failed {pid}: {exc}")
             else:
-                _job_append_log(job_id, f"✗ summariser exit {code} for backlog {pid}")
+                reason = error_text or (log_lines[-1] if log_lines else "Unknown summariser failure")
+                log_tail = "; ".join(log_lines[-5:]) if log_lines else ""
+                _job_append_log(job_id, f"✗ summariser failed backlog {pid}; skipping")
+                _record_council_failure(
+                    "summariser",
+                    pid,
+                    title,
+                    f"{reason}" if not log_tail else f"{reason} | log_tail={log_tail}",
+                    context=(
+                        f"backlog_index={index}/{backlog_total}, remaining={remaining_backlog}, "
+                        f"display_title={display_title}"
+                    ),
+                )
 
             _job_increment(job_id, "done", 1)
 
@@ -2701,8 +2753,8 @@ def _worker_refresh_summaries(job_id: str):
                     )
                     _job_append_log(job_id, f"→ summarising {pid}")
 
-                    code = _stream_summariser(pid, title)
-                    if code == 0:
+                    success, error_text, log_lines = _stream_summariser(pid, title)
+                    if success:
                         summarised.add(pid)
                         _job_append_log(job_id, f"✓ summarised {pid}")
                         try:
@@ -2733,7 +2785,19 @@ def _worker_refresh_summaries(job_id: str):
                                 interest_score_val = None
                         _record_new_post(pid, title, interest_score_val)
                     else:
-                        _job_append_log(job_id, f"✗ summariser exit {code} for {pid}")
+                        reason = error_text or (log_lines[-1] if log_lines else "Unknown summariser failure")
+                        log_tail = "; ".join(log_lines[-5:]) if log_lines else ""
+                        _job_append_log(job_id, f"✗ summariser failed {pid}; skipping")
+                        _record_council_failure(
+                            "summariser",
+                            pid,
+                            title,
+                            f"{reason}" if not log_tail else f"{reason} | log_tail={log_tail}",
+                            context=(
+                                f"csv_index={csv_processed}/{csv_total}, remaining={remaining_csv}, "
+                                f"display_title={display_title}"
+                            ),
+                        )
 
                     _job_increment(job_id, "done", 1)
 
