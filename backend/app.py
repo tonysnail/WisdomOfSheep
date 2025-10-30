@@ -2411,6 +2411,32 @@ def _worker_refresh_summaries(job_id: str):
             ts = dt.timestamp() if dt else float("inf")
             return (ts, scraped_txt, str(entry.get("post_id") or ""))
 
+        def _normalize_article(article: Dict[str, Any]) -> Dict[str, Any]:
+            def _clean(value: Any) -> str:
+                return str(value or "").strip()
+
+            platform = _clean(article.get("platform"))
+            post_id = _clean(article.get("post_id"))
+            scraped_at = _clean(article.get("scraped_at"))
+            if not scraped_at:
+                scraped_at = _clean(article.get("posted_at"))
+            source = _clean(article.get("source"))
+            title = _clean(article.get("title")) or _clean(article.get("headline"))
+
+            normalized = {
+                "platform": platform,
+                "post_id": post_id,
+                "scraped_at": scraped_at,
+                "source": source,
+                "title": title or (post_id if post_id else ""),
+            }
+
+            for key, value in normalized.items():
+                if value:
+                    article[key] = value
+
+            return normalized
+
         def _run_oracle_council(post_id: str, title: str, interest_score: Optional[float]) -> None:
             nonlocal failed_post_ids
             if not oracle_handles_council:
