@@ -2527,20 +2527,6 @@ def erase_all_council_analysis():
     }
 
 
-@app.get("/api/refresh-summaries/{job_id}")
-def get_refresh_summaries(job_id: str):
-    job = _load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="job-not-found")
-    # return a copy with computed message
-    msg = ""
-    if job.get("total", 0) > 0:
-        msg = f'{job.get("phase", "")} {job.get("done", 0)}/{job.get("total", 0)} — {job.get("current", "")}'
-    data = dict(job)
-    data["message"] = msg.strip()
-    return data
-
-
 @app.get("/api/refresh-summaries/active")
 def get_active_refresh_summaries():
     global ACTIVE_JOB_ID
@@ -2562,6 +2548,20 @@ def get_active_refresh_summaries():
         "total": job.get("total"),
         "done": job.get("done"),
     }
+
+
+@app.get("/api/refresh-summaries/{job_id}")
+def get_refresh_summaries(job_id: str):
+    job = _load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job-not-found")
+    # return a copy with computed message
+    msg = ""
+    if job.get("total", 0) > 0:
+        msg = f'{job.get("phase", "")} {job.get("done", 0)}/{job.get("total", 0)} — {job.get("current", "")}'
+    data = dict(job)
+    data["message"] = msg.strip()
+    return data
 
 
 @app.post("/api/refresh-summaries/{job_id}/stop")
