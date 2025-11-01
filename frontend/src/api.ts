@@ -165,6 +165,22 @@ export async function eraseAllCouncilAnalysis(): Promise<{
   return json(res)
 }
 
+export async function repairDatabase(options?: RepairDatabaseOptions): Promise<RepairDatabaseResponse> {
+  const payload: Record<string, unknown> = {}
+  if (typeof options?.allowReset === 'boolean') {
+    payload.allow_reset = options.allowReset
+  }
+  if (options?.restoreBackup) {
+    payload.restore_backup = options.restoreBackup
+  }
+  const res = await fetch(`${API}/api/database/repair`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  return json(res)
+}
+
 export type RefreshSummariesMode = 'full' | 'new_only'
 
 export async function startRefreshSummaries(options?: {
@@ -297,6 +313,33 @@ export type CouncilJob = {
   current_stage?: string | null
   current_stage_label?: string | null
   current_stage_detail?: string | null
+}
+
+export type DatabaseBackupInfo = {
+  name: string
+  path: string
+  size: number
+  modified: string
+  kind: string
+}
+
+export type RepairDatabaseResponse = {
+  ok: boolean
+  message: string
+  actions: string[]
+  warnings: string[]
+  reset_performed: boolean
+  restored_backup?: string | null
+  backup_path?: string | null
+  wal_cleaned: boolean
+  integrity_ok?: boolean | null
+  needs_reset: boolean
+  backups: DatabaseBackupInfo[]
+}
+
+export type RepairDatabaseOptions = {
+  allowReset?: boolean
+  restoreBackup?: string
 }
 
 export async function startCouncilAnalysis(options: {
