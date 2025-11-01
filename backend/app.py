@@ -3871,6 +3871,7 @@ def get_council_analysis(job_id: str):
 
 @app.get("/api/council-analysis/active")
 def get_active_council_analysis():
+    global ACTIVE_COUNCIL_JOB_ID
     with COUNCIL_JOB_LOCK:
         job_id = ACTIVE_COUNCIL_JOB_ID
 
