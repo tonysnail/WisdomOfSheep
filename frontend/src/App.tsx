@@ -58,6 +58,61 @@ const parseInterestScore = (value: unknown): number | null => {
   return null
 }
 
+type CouncilStageIndicator = {
+  stage: string
+  detail: string | null
+}
+
+type OracleStatusVariant = 'positive' | 'warning' | 'negative' | 'neutral'
+
+const normalizeCouncilStageLabel = (stage: string): string => {
+  const trimmed = stage.trim()
+  if (!trimmed) return 'Council analysis'
+  const lower = trimmed.toLowerCase()
+  if (Object.prototype.hasOwnProperty.call(COUNCIL_STAGE_LABELS, lower)) {
+    return COUNCIL_STAGE_LABELS[lower]
+  }
+  for (const value of Object.values(COUNCIL_STAGE_LABELS)) {
+    if (value.toLowerCase() === lower) {
+      return value
+    }
+  }
+  return trimmed.charAt(0).toUpperCase() + trimmed.slice(1)
+}
+
+const extractLatestCouncilStage = (log: string): CouncilStageIndicator | null => {
+  if (!log.trim()) return null
+  const lines = log
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]
+    if (!line.startsWith('→')) continue
+    const content = line.replace(/^→\s*/, '').trim()
+    if (!content) continue
+
+    const analysisMatch = content.match(/^(analysing|repairing)\s+(.+)$/i)
+    if (analysisMatch) {
+      const action = analysisMatch[1].toLowerCase() === 'repairing' ? 'Repairing article' : 'Analysing article'
+      const detail = analysisMatch[2].trim() || null
+      return { stage: action, detail }
+    }
+
+    const forMatch = content.match(/^(.*?)(?:\s+for\s+(.+))?$/i)
+    if (forMatch) {
+      const stageLabel = normalizeCouncilStageLabel(forMatch[1] ?? '')
+      const detail = (forMatch[2] ?? '').trim() || null
+      if (stageLabel) {
+        return { stage: stageLabel, detail }
+      }
+    }
+  }
+
+  return null
+}
+
 const normalizeOracleStatusValue = (value: unknown): OracleStatus => {
   const allowed: OracleStatus[] = [
     'offline',
@@ -331,22 +386,60 @@ export default function App() {
   const councilDisplayLog = (councilLogEntry || councilJobMessage || councilLastLine).trim()
   const panelDisabled = busy || jobBusy || councilJobBusy || analyseNewActive
   const oracleControlsDisabled = working || jobActive || councilJobActive || councilJobBusy || analyseNewActive
-  const oracleStatusVariant = useMemo(() => {
-    switch (oracleStatus) {
-      case 'processing':
-        return 'positive'
-      case 'idle':
-      case 'warmup':
-      case 'connecting':
-        return 'warning'
-      case 'unauthorized':
-      case 'error':
-        return 'negative'
-      default:
-        return 'neutral'
+  const oracleStatusIndicator = useMemo(() => {
+    if (councilJobActive) {
+      const stageInfo = extractLatestCouncilStage(councilLog)
+      let stageLabel = stageInfo?.stage ?? ''
+      if (!stageLabel) {
+        if (councilJob?.status === 'queued') {
+          stageLabel = 'Queued'
+        } else if (councilJob?.status === 'cancelling') {
+          stageLabel = 'Cancelling'
+        } else {
+          stageLabel = 'Council analysis running'
+        }
+      }
+
+      const messageText = (councilJob?.message ?? '').trim()
+      const messageParts = messageText
+        ? messageText.split(' — ').map((part) => part.trim()).filter((part) => part.length > 0)
+        : []
+
+      const detailParts = [stageInfo?.detail?.trim() ?? '', ...messageParts]
+
+      if (!stageInfo?.detail && messageParts.length === 0) {
+        const currentText = (councilJob?.current ?? '').trim()
+        if (currentText) detailParts.push(currentText)
+      }
+
+      if (typeof councilJob?.remaining === 'number' && messageParts.length === 0) {
+        const remainingLabel = `${Math.max(councilJob.remaining, 0)} remaining`
+        detailParts.push(remainingLabel)
+      }
+
+      if ((councilJob?.current_mode ?? '').toLowerCase() === 'repair') {
+        detailParts.push('repair queue')
+      }
+
+      const filteredParts = detailParts
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0)
+        .filter((part, index, arr) => {
+          const lower = part.toLowerCase()
+          return arr.findIndex((candidate) => candidate.trim().toLowerCase() === lower) === index
+        })
+
+      const detailText = filteredParts.join(' — ')
+      const rawCouncilText = detailText
+        ? `Council: ${stageLabel} — ${detailText}`
+        : `Council: ${stageLabel}`
+
+      return {
+        variant: 'warning' as OracleStatusVariant,
+        text: truncateOracleStatus(rawCouncilText),
+      }
     }
-  }, [oracleStatus])
-  const oracleStatusText = useMemo(() => {
+
     const cursorBits: string[] = []
     if (oracleCursor) {
       const parts: string[] = []
@@ -357,18 +450,27 @@ export default function App() {
         cursorBits.push(`last ${parts.join(' ')}`.trim())
       }
     }
+
+    let variant: OracleStatusVariant
+    let text: string
+
     switch (oracleStatus) {
       case 'connecting':
-        return truncateOracleStatus('Oracle: Connecting…')
+        variant = 'warning'
+        text = 'Oracle: Connecting…'
+        break
       case 'warmup':
-        return truncateOracleStatus('Oracle: Warm-up scan…')
+        variant = 'warning'
+        text = 'Oracle: Warm-up scan…'
+        break
       case 'processing':
-        return truncateOracleStatus(
-          cursorBits.length > 0
-            ? `Oracle: Processing (${cursorBits.join(' · ')})`
-            : 'Oracle: Processing…',
-        )
+        variant = 'positive'
+        text = cursorBits.length > 0
+          ? `Oracle: Processing (${cursorBits.join(' · ')})`
+          : 'Oracle: Processing…'
+        break
       case 'idle': {
+        variant = 'warning'
         const pollText =
           oracleIdleInfo?.pollSeconds != null
             ? `${oracleIdleInfo.pollSeconds.toFixed(1)}s`
@@ -379,16 +481,44 @@ export default function App() {
           idleSegment = ` • Idle for ${formatEta(elapsed)}`
         }
         const cursorSegment = cursorBits.length > 0 ? ` • ${cursorBits.join(' · ')}` : ''
-        return truncateOracleStatus(`Oracle: Idle (poll ${pollText})${idleSegment}${cursorSegment}`)
+        text = `Oracle: Idle (poll ${pollText})${idleSegment}${cursorSegment}`
+        break
       }
       case 'unauthorized':
-        return truncateOracleStatus('Oracle: Unauthorized')
+        variant = 'negative'
+        text = 'Oracle: Unauthorized'
+        break
       case 'error':
-        return truncateOracleStatus('Oracle: Error')
+        variant = 'negative'
+        text = 'Oracle: Error'
+        break
       default:
-        return truncateOracleStatus('Oracle: Offline')
+        variant = 'neutral'
+        text = 'Oracle: Offline'
+        break
     }
-  }, [oracleStatus, oracleIdleInfo, oracleCursor])
+
+    return {
+      variant,
+      text: truncateOracleStatus(text),
+    }
+  }, [
+    councilJobActive,
+    councilLog,
+    councilJob?.message,
+    councilJob?.current,
+    councilJob?.remaining,
+    councilJob?.current_mode,
+    councilJob?.status,
+    oracleStatus,
+    oracleIdleInfo?.pollSeconds,
+    oracleIdleInfo?.idleSince,
+    oracleCursor?.platform,
+    oracleCursor?.post_id,
+    oracleCursor?.scraped_at,
+  ])
+  const oracleStatusVariant = oracleStatusIndicator.variant
+  const oracleStatusText = oracleStatusIndicator.text
 
   const deriveLogSnippet = (value: string): string => {
     const trimmed = value.trim()
