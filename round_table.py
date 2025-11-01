@@ -39,6 +39,8 @@ from datetime import datetime, timezone, timedelta
 import sqlite3, json, time
 import pandas as pd
 import requests
+
+_DB_LOGGER = logging.getLogger("round_table.db")
 from pathlib import Path
 from pydantic import BaseModel, Field, conint, confloat
 
@@ -191,21 +193,29 @@ def _now_iso():
     import time
     return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
 
+def _checkpoint_wal(con: sqlite3.Connection) -> None:
+    """Flush WAL contents so the main DB reflects the latest writes."""
+
+    try:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.DatabaseError as exc:  # pragma: no cover - defensive path
+        _DB_LOGGER.debug("WAL checkpoint skipped: %s", exc)
+
 def write_stage(post_id, stage, payload):
-    con = sqlite3.connect(str(DB_PATH))
-    con.execute("""
+    with sqlite3.connect(str(DB_PATH)) as con:
+        con.execute("""
         INSERT INTO stages(post_id, stage, created_at, payload)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(post_id, stage) DO UPDATE SET
           created_at=excluded.created_at,
           payload=excluded.payload
     """, (post_id, stage, _now_iso(), json.dumps(payload, ensure_ascii=False)))
-    con.commit()
-    con.close()
+        con.commit()
+        _checkpoint_wal(con)
 
 def upsert_post(row):
-    con = sqlite3.connect(str(DB_PATH))
-    con.execute("""
+    with sqlite3.connect(str(DB_PATH)) as con:
+        con.execute("""
         INSERT INTO posts(post_id, platform, source, url, title, author,
                           scraped_at, posted_at, score, text)
         VALUES (:post_id, :platform, :source, :url, :title, :author,
@@ -221,8 +231,8 @@ def upsert_post(row):
           score=excluded.score,
           text=excluded.text;
     """, row)
-    con.commit()
-    con.close()
+        con.commit()
+        _checkpoint_wal(con)
 
 # ---- redex helpers ----
 _CASHTAG_RE = re.compile(r"\$([A-Za-z]{1,5})(?![A-Za-z0-9])")
@@ -1767,6 +1777,7 @@ def _ensure_tables() -> None:
         """
         )
         con.commit()
+        _checkpoint_wal(con)
 
 
 def _fetch_post_row(post_id: str) -> Optional[Dict[str, Any]]:
@@ -1814,6 +1825,7 @@ def _write_post_extras(post_id: str, extras: Dict[str, Any]) -> None:
                 (post_id, json.dumps(extras, ensure_ascii=False)),
             )
             con.commit()
+            _checkpoint_wal(con)
     except Exception:
         # extras are optional; swallow errors to keep pipeline running
         pass
