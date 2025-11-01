@@ -732,14 +732,6 @@ def _append_skipped_article_entry(entry: Dict[str, Any], keep: int = 200) -> Non
     os.replace(tmp_path, ORACLE_SKIPPED_PATH)
 
 
-def _oracle_auth_tuple() -> Optional[Tuple[str, str]]:
-    user = (ORACLE_USER or "").strip()
-    pwd = (ORACLE_PASS or "").strip()
-    if not (user and pwd):
-        return None
-    return user, pwd
-
-
 def _oracle_join(base_url: str, path: str) -> str:
     base = (base_url or "").strip()
     if not base:
@@ -752,6 +744,47 @@ def _oracle_join(base_url: str, path: str) -> str:
 # =========================
 # Endpoints
 # =========================
+def _process_oracle_health_response(
+    job_id: str,
+    response: Optional[requests.Response],
+) -> bool:
+    """Handle the Oracle /healthz response.
+
+    Returns True when the worker should continue, False when it should stop.
+    """
+
+    if response is None:
+        return False
+
+    status = getattr(response, "status_code", None)
+    if status is None:
+        return False
+
+    if status >= 400:
+        if status in {404, 405}:
+            _job_append_log(
+                job_id,
+                f"⚠ Oracle /healthz returned {status}; skipping health check",
+            )
+            return True
+
+        _job_append_log(job_id, f"✗ Oracle /healthz returned {status}")
+        _job_update_fields(
+            job_id,
+            status="error",
+            error=f"oracle-healthz-{status}",
+            oracle_status="error",
+            phase="",
+            current="",
+            oracle_poll_seconds=None,
+            oracle_idle_since=None,
+            ended_at=time.time(),
+        )
+        return False
+
+    return True
+
+
 def _worker_refresh_summaries(job_id: str):
     global ACTIVE_JOB_ID
     job = _load_job(job_id)
@@ -1205,22 +1238,7 @@ def _worker_refresh_summaries(job_id: str):
             oracle_idle_since=None,
         )
 
-        health_resp = _request("/healthz")
-        if health_resp is None:
-            return
-        if health_resp.status_code >= 400:
-            _job_append_log(job_id, f"✗ Oracle /healthz returned {health_resp.status_code}")
-            _job_update_fields(
-                job_id,
-                status="error",
-                error=f"oracle-healthz-{health_resp.status_code}",
-                oracle_status="error",
-                phase="",
-                current="",
-                oracle_poll_seconds=None,
-                oracle_idle_since=None,
-                ended_at=time.time(),
-            )
+        if not _process_oracle_health_response(job_id, _request("/healthz")):
             return
 
         _job_update_fields(
@@ -2478,6 +2496,32 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
     }
 
 
+@app.get("/api/council-analysis/active")
+def get_active_council_analysis():
+    global ACTIVE_COUNCIL_JOB_ID
+    with COUNCIL_JOB_LOCK:
+        job_id = ACTIVE_COUNCIL_JOB_ID
+
+    if not job_id:
+        return Response(status_code=204)
+
+    job = _load_job(job_id)
+    if not job:
+        with COUNCIL_JOB_LOCK:
+            if ACTIVE_COUNCIL_JOB_ID == job_id:
+                ACTIVE_COUNCIL_JOB_ID = None
+        return Response(status_code=204)
+
+    return {
+        "job_id": job_id,
+        "status": job.get("status"),
+        "total": job.get("total"),
+        "done": job.get("done"),
+        "remaining": job.get("remaining"),
+        "interest_min": job.get("interest_min"),
+    }
+
+
 @app.get("/api/council-analysis/{job_id}")
 def get_council_analysis(job_id: str):
     job = _load_job(job_id)
@@ -2496,32 +2540,6 @@ def get_council_analysis(job_id: str):
     data = dict(job)
     data["message"] = " — ".join(part for part in msg_parts if part)
     return data
-
-
-@app.get("/api/council-analysis/active")
-def get_active_council_analysis():
-    global ACTIVE_COUNCIL_JOB_ID
-    with COUNCIL_JOB_LOCK:
-        job_id = ACTIVE_COUNCIL_JOB_ID
-
-    if not job_id:
-        return Response(status_code=204)
-
-    job = _load_job(job_id)
-    if not job:
-        with COUNCIL_JOB_LOCK:
-            if ACTIVE_COUNCIL_JOB_ID == job_id:
-                ACTIVE_COUNCIL_JOB_ID = None
-        raise HTTPException(status_code=404, detail="job-not-found")
-
-    return {
-        "job_id": job_id,
-        "status": job.get("status"),
-        "total": job.get("total"),
-        "done": job.get("done"),
-        "remaining": job.get("remaining"),
-        "interest_min": job.get("interest_min"),
-    }
 
 
 @app.post("/api/council-analysis/{job_id}/stop")
