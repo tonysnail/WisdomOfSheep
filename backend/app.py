@@ -732,14 +732,6 @@ def _append_skipped_article_entry(entry: Dict[str, Any], keep: int = 200) -> Non
     os.replace(tmp_path, ORACLE_SKIPPED_PATH)
 
 
-def _oracle_auth_tuple() -> Optional[Tuple[str, str]]:
-    user = (ORACLE_USER or "").strip()
-    pwd = (ORACLE_PASS or "").strip()
-    if not (user and pwd):
-        return None
-    return user, pwd
-
-
 def _oracle_join(base_url: str, path: str) -> str:
     base = (base_url or "").strip()
     if not base:
