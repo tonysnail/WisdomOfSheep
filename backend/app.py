@@ -40,6 +40,7 @@ PARENT_DIR_STR = str(PARENT_DIR)
 if PARENT_DIR_STR not in sys.path:
     sys.path.insert(0, PARENT_DIR_STR)
 
+from backend import database as _database_module
 from backend import utils
 from backend.council_time import CouncilTimeModel, approximate_token_count
 from backend.config import (
@@ -81,8 +82,8 @@ from backend.conversation import (
     load_ticker_universe as _load_ticker_universe,
 )
 from backend.database import (
-    connect as _connect,
-    ensure_database_ready as _ensure_database_ready,
+    connect as _db_connect,
+    ensure_database_ready as _db_ensure_database_ready,
     ensure_schema as _ensure_schema,
     execute as _exec,
     insert_stage_payload as _insert_stage_payload,
@@ -187,6 +188,23 @@ _extract_claim_texts = utils.extract_claim_texts
 _direction_estimate = utils.direction_estimate
 _primary_ticker = utils.primary_ticker
 _trim = utils.trim
+
+
+def _sync_db_path() -> Path:
+    """Ensure the database module honours the current DB_PATH."""
+    path = Path(DB_PATH)
+    _database_module.DB_PATH = path
+    return path
+
+
+def _ensure_database_ready() -> None:
+    _sync_db_path()
+    _db_ensure_database_ready()
+
+
+def _connect() -> sqlite3.Connection:
+    _sync_db_path()
+    return _db_connect()
 
 
 def _norm_optional_str(value: Any) -> Optional[str]:
@@ -342,8 +360,16 @@ def _article_summary_tokens(post_id: str) -> Tuple[int, int]:
         _ensure_schema(conn)
         row = _q_one(conn, "SELECT text FROM posts WHERE post_id = ?", (post_id,))
         article_text = ""
-        if row and row.get("text"):
-            article_text = str(row["text"] or "")
+        if row:
+            try:
+                value = row["text"]
+            except (KeyError, IndexError, TypeError):  # sqlite3.Row may not support mapping access
+                try:
+                    value = row[0]
+                except Exception:  # noqa: BLE001
+                    value = None
+            if value:
+                article_text = str(value or "")
         summary_payload = _latest_stage_payload(conn, post_id, "summariser") or {}
     summary_text = _extract_summary_text(summary_payload)
     return approximate_token_count(article_text), approximate_token_count(summary_text)
@@ -2449,7 +2475,16 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
             "repairs_total": len(repair_queue),
         }
 
-    thread = threading.Thread(target=_worker_council_analysis, args=(job_id,), daemon=True)
+    def _thread_runner() -> None:
+        global ACTIVE_COUNCIL_JOB_ID
+        try:
+            _worker_council_analysis(job_id)
+        finally:
+            with COUNCIL_JOB_LOCK:
+                if ACTIVE_COUNCIL_JOB_ID == job_id:
+                    ACTIVE_COUNCIL_JOB_ID = None
+
+    thread = threading.Thread(target=_thread_runner, daemon=True)
     thread.start()
 
     return {
@@ -2485,6 +2520,7 @@ def get_council_analysis(job_id: str):
 
 @app.get("/api/council-analysis/active")
 def get_active_council_analysis():
+    global ACTIVE_COUNCIL_JOB_ID
     with COUNCIL_JOB_LOCK:
         job_id = ACTIVE_COUNCIL_JOB_ID
 
@@ -2529,6 +2565,7 @@ def stop_council_analysis(job_id: str):
 
 @app.post("/api/council-analysis/erase-all")
 def erase_all_council_analysis():
+    global ACTIVE_COUNCIL_JOB_ID
     with COUNCIL_JOB_LOCK:
         active_job_id = ACTIVE_COUNCIL_JOB_ID
 
