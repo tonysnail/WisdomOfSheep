@@ -113,6 +113,7 @@ SCHEMA_PATH = ROOT / "council" / "council_schema.sql"
 TIME_MODEL_PATH = ROOT / "council" / "council_time_model.json"
 CSV_PATH = ROOT / "raw_posts_log.csv"
 TICKERS_DIR = ROOT / "tickers"  # <- your new folder
+DB_REPAIR_DIR = (ROOT / "council" / ".db-repair").resolve()
 
 
 DATA_DIR = ROOT / "data"
@@ -153,6 +154,15 @@ def _handle_wal_files(base_path: Path, dest_base: Path | None) -> None:
                 candidate.unlink()
         except OSError:
             continue
+
+
+def _wal_files(base_path: Path) -> List[Path]:
+    files: List[Path] = []
+    for suffix in ("-wal", "-shm"):
+        candidate = base_path.with_name(f"{base_path.name}{suffix}")
+        if candidate.exists():
+            files.append(candidate)
+    return files
 
 
 def _read_schema() -> str:
@@ -217,8 +227,67 @@ def _backup_corrupt_db(path: Path) -> Path | None:
     return backup
 
 
+def _format_backup_metadata(path: Path, kind: str) -> Dict[str, Any]:
+    stat = path.stat()
+    modified = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+    return {
+        "name": path.name,
+        "path": str(path),
+        "size": int(stat.st_size),
+        "modified": modified,
+        "kind": kind,
+    }
+
+
+def _list_db_backups() -> List[Dict[str, Any]]:
+    backups: List[Dict[str, Any]] = []
+    stem = DB_PATH.stem
+    suffix = DB_PATH.suffix
+    parent = DB_PATH.parent
+    patterns: List[Tuple[str, str]] = [
+        (f"{stem}.corrupt-*{suffix}", "corrupt"),
+        (f"{stem}.backup-*{suffix}", "backup"),
+        (f"{stem}.restore-*{suffix}", "restore"),
+    ]
+    for pattern, kind in patterns:
+        for candidate in sorted(parent.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True):
+            backups.append(_format_backup_metadata(candidate, kind))
+    return backups
+
+
+def _run_integrity_check(path: Path, actions: List[str], warnings: List[str]) -> bool:
+    try:
+        with sqlite3.connect(str(path)) as conn:
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                actions.append("checkpoint-truncate")
+            except sqlite3.DatabaseError as exc:
+                warnings.append(f"WAL checkpoint failed: {exc}")
+            try:
+                conn.execute("PRAGMA optimize")
+                actions.append("pragma-optimize")
+            except sqlite3.DatabaseError:
+                pass
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+            result = str(row[0]).strip().lower() if row and row[0] is not None else ""
+            actions.append(f"integrity-check:{result or 'unknown'}")
+            if result != "ok":
+                warnings.append(f"Integrity check reported '{result or 'unknown'}'.")
+                return False
+            try:
+                conn.execute("VACUUM")
+                actions.append("vacuum")
+            except sqlite3.DatabaseError:
+                warnings.append("VACUUM failed to run; database may be busy.")
+            return True
+    except sqlite3.DatabaseError as exc:
+        warnings.append(f"Integrity check failed: {exc}")
+        return False
+
+
 _DB_READY_LOCK = threading.Lock()
 _DB_READY_PATH: Path | None = None
+DB_MAINTENANCE_LOCK = threading.Lock()
 
 
 def _ensure_database_ready() -> None:
@@ -244,6 +313,125 @@ def _ensure_database_ready() -> None:
             _initialize_db_file(current)
 
         _DB_READY_PATH = current
+
+
+def _perform_database_repair(payload: RepairDatabaseRequest) -> RepairDatabaseResponse:
+    DB_REPAIR_DIR.mkdir(parents=True, exist_ok=True)
+    allow_reset = bool(payload.allow_reset)
+    restore_name = (payload.restore_backup or "").strip()
+    actions: List[str] = []
+    warnings: List[str] = []
+    path = Path(DB_PATH)
+    wal_cleaned = False
+    reset_performed = False
+    backup_path: Optional[str] = None
+    restored_backup: Optional[str] = None
+    integrity_ok: Optional[bool] = None
+    needs_reset = False
+    message = ""
+
+    existing_backups = _list_db_backups()
+    backup_lookup = {entry["name"]: Path(entry["path"]) for entry in existing_backups}
+
+    if restore_name:
+        backup_candidate = backup_lookup.get(restore_name)
+        if backup_candidate is None:
+            raise HTTPException(status_code=404, detail="backup-not-found")
+
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        if path.exists():
+            existing_wal = _wal_files(path)
+            backup_file = path.with_name(f"{path.stem}.backup-{timestamp}{path.suffix}")
+            shutil.copyfile(path, backup_file)
+            actions.append(f"Backed up current database to {backup_file.name}")
+            backup_path = str(backup_file)
+            _handle_wal_files(path, backup_file)
+            if existing_wal:
+                wal_cleaned = True
+                actions.append(f"Captured {len(existing_wal)} WAL/SHM file(s) alongside backup")
+        else:
+            actions.append("No existing database file to back up before restore")
+        _handle_wal_files(path, None)
+        shutil.copyfile(str(backup_candidate), str(path))
+        restored_backup = backup_candidate.name
+        actions.append(f"Restored backup {restored_backup}")
+        _handle_wal_files(path, None)
+        integrity_ok = _run_integrity_check(path, actions, warnings)
+        if integrity_ok:
+            message = f"Backup {restored_backup} restored successfully."
+        else:
+            message = f"Backup {restored_backup} restored but integrity check failed."
+            needs_reset = True
+    else:
+        if not path.exists():
+            if allow_reset:
+                _initialize_db_file(path)
+                actions.append("Created new database file")
+                reset_performed = True
+                integrity_ok = True
+                message = "Database file was missing; initialised a new one."
+            else:
+                warnings.append("Database file is missing.")
+                needs_reset = True
+                message = "Database file is missing. Allow reset to create a new one."
+        else:
+            wal_candidates = _wal_files(path)
+            if wal_candidates:
+                timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                repair_base = DB_REPAIR_DIR / f"{path.stem}.repair-{timestamp}{path.suffix}"
+                _handle_wal_files(path, repair_base)
+                wal_cleaned = True
+                actions.append(
+                    f"Moved {len(wal_candidates)} WAL/SHM file(s) to {repair_base.parent.name or repair_base.parent}"
+                )
+            integrity_ok = _run_integrity_check(path, actions, warnings)
+            if integrity_ok:
+                message = "Database integrity check completed successfully."
+            else:
+                needs_reset = True
+                message = "Database failed integrity check; reset required."
+                if allow_reset:
+                    backup = _backup_corrupt_db(path)
+                    if backup is not None:
+                        backup_path = str(backup)
+                        actions.append(f"Backed up corrupt database to {Path(backup_path).name}")
+                    else:
+                        actions.append("Corrupt database backup skipped (file missing)")
+                    _initialize_db_file(path)
+                    actions.append("Initialised new database file")
+                    integrity_ok = True
+                    needs_reset = False
+                    reset_performed = True
+                    message = "Corrupt database reset to a new empty file."
+
+    with _DB_READY_LOCK:
+        _DB_READY_PATH = None
+
+    if integrity_ok:
+        try:
+            _ensure_database_ready()
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("database repair follow-up ensure failed")
+
+    updated_backups = _list_db_backups()
+    backups_model = [DatabaseBackupEntry(**entry) for entry in updated_backups]
+
+    ok = bool(integrity_ok and not needs_reset)
+
+    return RepairDatabaseResponse(
+        ok=ok,
+        message=message or "",
+        actions=actions,
+        warnings=warnings,
+        reset_performed=reset_performed,
+        restored_backup=restored_backup,
+        backup_path=backup_path,
+        wal_cleaned=wal_cleaned,
+        integrity_ok=integrity_ok,
+        needs_reset=needs_reset,
+        backups=backups_model,
+    )
+
 
 PAGE_SIZE_DEFAULT = _env_int("WOS_PAGE_SIZE", 50)
 BATCH_LIMIT = _env_int("WOS_BATCH_LIMIT", 200)
@@ -621,6 +809,33 @@ class RunStageResponse(BaseModel):
     stages_run: List[str]
     stdout: str = Field(default="")
     stderr: str = Field(default="")
+
+
+class RepairDatabaseRequest(BaseModel):
+    allow_reset: bool = False
+    restore_backup: Optional[str] = None
+
+
+class DatabaseBackupEntry(BaseModel):
+    name: str
+    path: str
+    size: int
+    modified: str
+    kind: str
+
+
+class RepairDatabaseResponse(BaseModel):
+    ok: bool
+    message: str
+    actions: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    reset_performed: bool = False
+    restored_backup: Optional[str] = None
+    backup_path: Optional[str] = None
+    wal_cleaned: bool = False
+    integrity_ok: Optional[bool] = None
+    needs_reset: bool = False
+    backups: List[DatabaseBackupEntry] = Field(default_factory=list)
 
 
 def _parse_interest_debug(raw: Any) -> Dict[str, Any]:
@@ -4001,6 +4216,14 @@ def erase_all_council_analysis():
         "deleted_stages": deleted,
         "cleared_research_posts": cleared,
     }
+
+
+@app.post("/api/database/repair", response_model=RepairDatabaseResponse)
+def repair_database(payload: RepairDatabaseRequest | None = Body(default=None)) -> RepairDatabaseResponse:
+    request = payload or RepairDatabaseRequest()
+    with DB_MAINTENANCE_LOCK:
+        result = _perform_database_repair(request)
+    return result
 
 
 @app.get("/api/refresh-summaries/{job_id}")

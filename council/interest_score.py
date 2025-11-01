@@ -281,6 +281,7 @@ def _get_recent_texts_for_ticker_factory(conv_path: str) -> Optional[callable]:
                 SELECT data
                 FROM conversations
                 WHERE UPPER(ticker) = UPPER(?)
+                  AND UPPER(kind) = 'DELTA'
                   AND datetime(replace(substr(ts,1,19),'T',' ')) BETWEEN ? AND ?
                 ORDER BY ts ASC
                 LIMIT 100;

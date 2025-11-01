@@ -13,8 +13,15 @@ import {
   getCouncilJob,
   getActiveCouncilJob,
   stopCouncilJob,
+  repairDatabase,
 } from './api'
-import type { CouncilJob, ListPostsParams, RefreshJob } from './api'
+import type {
+  CouncilJob,
+  ListPostsParams,
+  RefreshJob,
+  RepairDatabaseResponse,
+  DatabaseBackupInfo,
+} from './api'
 import type { ListResponse, PostDetail, ResearchPayload, ResearchTickerPayload } from './types'
 import PostList from './components/PostList'
 import PostDetailView from './components/PostDetail'
@@ -255,6 +262,10 @@ export default function App() {
   const [analyseNewRefreshComplete, setAnalyseNewRefreshComplete] = useState(false)
   const [analyseNewHadEligible, setAnalyseNewHadEligible] = useState(false)
   const [analyseNewCancelRequested, setAnalyseNewCancelRequested] = useState(false)
+  const [repairResult, setRepairResult] = useState<RepairDatabaseResponse | null>(null)
+  const [repairBackups, setRepairBackups] = useState<DatabaseBackupInfo[]>([])
+  const [repairSelectedBackup, setRepairSelectedBackup] = useState('')
+  const [repairBusy, setRepairBusy] = useState(false)
   const analyseNewCancelTargetsRef = useRef<{
     refreshId: string | null
     refreshRequested: boolean
@@ -411,6 +422,10 @@ export default function App() {
   const panelDisabled = busy || jobBusy || councilJobBusy || analyseNewActive || analyseNewCancelRequested
   const oracleControlsDisabled =
     working || jobActive || councilJobActive || councilJobBusy || analyseNewActive || analyseNewCancelRequested
+  const repairNeedsReset = Boolean(repairResult?.needs_reset && !repairResult?.reset_performed)
+  const repairResetPerformed = Boolean(repairResult?.reset_performed)
+  const repairMessage = (repairResult?.message ?? '').trim()
+  const repairWarnings = repairResult?.warnings ?? []
   const oracleStatusIndicator = useMemo(() => {
     if (councilProgress) {
       const stageLabelText = councilStageLabel?.trim()
@@ -639,6 +654,17 @@ export default function App() {
     setLogSnippet(deriveLogSnippet(value))
   }
 
+  const appendLogLines = useCallback(
+    (lines: string[]) => {
+      if (!lines.length) return
+      updateLog((prev) => {
+        const prefix = prev && prev.trim().length > 0 ? `${prev}\n` : ''
+        return `${prefix}${lines.join('\n')}`
+      })
+    },
+    [updateLog],
+  )
+
   useEffect(() => {
     if (copyStatus === 'idle') return undefined
     if (typeof window === 'undefined') return undefined
@@ -693,6 +719,89 @@ export default function App() {
     }
     return undefined
   }, [oracleBaseUrl])
+
+  useEffect(() => {
+    if (repairBackups.length === 0) {
+      setRepairSelectedBackup('')
+      return
+    }
+    setRepairSelectedBackup((prev) => {
+      if (prev && repairBackups.some((entry) => entry.name === prev)) {
+        return prev
+      }
+      return repairBackups[0]?.name ?? ''
+    })
+  }, [repairBackups])
+
+  const handleRepairResult = useCallback(
+    (result: RepairDatabaseResponse, contextLabel: string) => {
+      setRepairResult(result)
+      setRepairBackups(result.backups ?? [])
+      const lines: string[] = []
+      const header = contextLabel.trim() ? `[Database] ${contextLabel.trim()}` : '[Database] Maintenance task'
+      lines.push(header)
+      const message = result.message?.trim()
+      if (message) {
+        lines.push(message)
+      }
+      if (result.actions.length > 0) {
+        result.actions.forEach((entry) => {
+          const text = entry && entry.trim() ? entry.trim() : null
+          if (text) lines.push(`  • ${text}`)
+        })
+      }
+      if (result.warnings.length > 0) {
+        result.warnings.forEach((entry) => {
+          const text = entry && entry.trim() ? entry.trim() : null
+          if (text) lines.push(`  ! ${text}`)
+        })
+      }
+      appendLogLines(lines)
+    },
+    [appendLogLines],
+  )
+
+  const runDatabaseMaintenance = useCallback(
+    async (options: { allowReset?: boolean; restoreBackup?: string } | undefined, label: string) => {
+      setRepairBusy(true)
+      try {
+        const response = await repairDatabase(options)
+        handleRepairResult(response, label)
+      } catch (err: any) {
+        appendLogLines([`[Database] ${label} failed: ${err?.message ?? err}`])
+      } finally {
+        setRepairBusy(false)
+      }
+    },
+    [appendLogLines, handleRepairResult],
+  )
+
+  const handleRepairDatabase = useCallback(() => {
+    void runDatabaseMaintenance(undefined, 'Repair council database')
+  }, [runDatabaseMaintenance])
+
+  const handleResetDatabase = useCallback(() => {
+    const confirmed =
+      typeof window !== 'undefined'
+        ? window.confirm(
+            'Resetting the council database will wipe all articles and analysis from the current file. A timestamped backup will be saved first. Continue?',
+          )
+        : false
+    if (!confirmed) return
+    void runDatabaseMaintenance({ allowReset: true }, 'Reset council database')
+  }, [runDatabaseMaintenance])
+
+  const handleRestoreBackup = useCallback(() => {
+    if (!repairSelectedBackup) return
+    const confirmed =
+      typeof window !== 'undefined'
+        ? window.confirm(
+            `Restore backup “${repairSelectedBackup}”? This will replace the active database; the current file will be saved before restoring.`,
+          )
+        : false
+    if (!confirmed) return
+    void runDatabaseMaintenance({ restoreBackup: repairSelectedBackup }, `Restore backup ${repairSelectedBackup}`)
+  }, [repairSelectedBackup, runDatabaseMaintenance])
 
   useEffect(() => {
     if (!analyseNewCancelRequested) return undefined
@@ -1902,6 +2011,74 @@ export default function App() {
               </div>
             </div>
           </div>
+        </div>
+
+        <div className="toolbar-row toolbar-database">
+          <div className="database-maintenance">
+            <button type="button" onClick={handleRepairDatabase} disabled={repairBusy}>
+              {repairBusy ? 'Working…' : 'Repair database'}
+            </button>
+            <button
+              type="button"
+              className="toolbar-danger"
+              onClick={handleResetDatabase}
+              disabled={repairBusy}
+              title="Resetting creates a new empty database after backing up the current file."
+            >
+              Reset database
+            </button>
+            <div className="database-restore-group">
+              <label htmlFor="database-backup-select">Restore backup</label>
+              <select
+                id="database-backup-select"
+                value={repairSelectedBackup}
+                onChange={(event) => setRepairSelectedBackup(event.target.value)}
+                disabled={repairBusy || repairBackups.length === 0}
+              >
+                {repairBackups.map((entry) => (
+                  <option key={entry.name} value={entry.name}>
+                    {entry.name}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                onClick={handleRestoreBackup}
+                disabled={repairBusy || !repairSelectedBackup}
+                title="Restore the selected backup. The current database is saved before restoring."
+              >
+                Restore
+              </button>
+            </div>
+          </div>
+          <div className="database-status-text">
+            {repairResult ? (
+              <div className="database-status-lines">
+                <span>{repairMessage || 'Database maintenance completed.'}</span>
+                {repairNeedsReset && !repairBusy && (
+                  <span className="database-warning">Integrity check failed — reset required.</span>
+                )}
+                {repairResetPerformed && !repairBusy && (
+                  <span className="database-success">Database was reset successfully.</span>
+                )}
+                {repairResult.restored_backup && (
+                  <span className="database-success">Restored {repairResult.restored_backup}</span>
+                )}
+                {repairResult.wal_cleaned && !repairNeedsReset && !repairResetPerformed && (
+                  <span className="database-note">WAL/SHM files were cleaned.</span>
+                )}
+              </div>
+            ) : (
+              <span className="muted small">Repair WAL/SHM mismatches or restore a backup if articles disappear.</span>
+            )}
+          </div>
+          {repairWarnings.length > 0 && (
+            <ul className="database-warning-list">
+              {repairWarnings.map((warning, index) => (
+                <li key={`repair-warning-${index}`}>{warning}</li>
+              ))}
+            </ul>
+          )}
         </div>
 
         <div className="toolbar-row toolbar-analyse-new">

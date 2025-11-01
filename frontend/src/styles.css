@@ -433,6 +433,22 @@ details.stage-log pre { margin:8px 0 0; font-size:12px; line-height:1.4; max-hei
 .toolbar-row.toolbar-slider label.disabled span { color:var(--muted); }
 .toolbar-row.toolbar-slider input[type='range'] { flex:0 0 260px; width:260px; max-width:260px; min-width:200px; }
 .toolbar-row.toolbar-slider input[type='range'][disabled] { opacity:0.5; cursor:not-allowed; filter:saturate(0.4); }
+.toolbar-row.toolbar-database { align-items:flex-start; gap:16px; flex-wrap:wrap; }
+.database-maintenance { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.database-maintenance button { padding:6px 12px; border-radius:8px; border:1px solid var(--line); background:rgba(16,24,36,0.8); color:var(--text); font-size:13px; font-weight:600; cursor:pointer; transition:background 0.2s ease, border 0.2s ease; }
+.database-maintenance button:disabled { opacity:0.5; cursor:not-allowed; }
+.database-maintenance button:not(.toolbar-danger):not(:disabled):hover,
+.database-maintenance button:not(.toolbar-danger):not(:disabled):focus-visible { background:rgba(32,44,62,0.85); border-color:rgba(91,221,255,0.5); outline:none; }
+.database-restore-group { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.database-restore-group label { font-size:12px; text-transform:uppercase; letter-spacing:0.05em; color:var(--muted); }
+.database-restore-group select { min-width:200px; max-width:280px; padding:6px 10px; border-radius:8px; border:1px solid var(--line); background:#101621; color:var(--text); font-size:13px; }
+.database-restore-group select:disabled { opacity:0.5; cursor:not-allowed; filter:saturate(0.4); }
+.database-status-text { display:flex; flex-direction:column; gap:4px; flex:1 1 240px; min-width:0; }
+.database-status-lines { display:flex; flex-direction:column; gap:4px; font-size:13px; color:var(--muted); }
+.database-warning { color:#ffb347; font-weight:600; }
+.database-success { color:#6fe1b1; font-weight:600; }
+.database-note { color:#9fb2c8; }
+.database-warning-list { margin:0; padding-left:18px; font-size:12px; color:#ffb347; }
 .toolbar-danger {
   background:linear-gradient(180deg, rgba(168, 44, 60, 0.92), rgba(108, 20, 32, 0.92));
   border:1px solid rgba(244, 120, 140, 0.65);

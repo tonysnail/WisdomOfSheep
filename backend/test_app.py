@@ -1,11 +1,32 @@
 import json
 import sqlite3
+import sys
 import time
+import types
+from datetime import datetime
 from typing import Any
 
 import pytest
 
 from backend import app as backend_app
+
+
+if "dateutil" not in sys.modules:
+    dateutil_module = types.ModuleType("dateutil")
+    parser_module = types.ModuleType("dateutil.parser")
+
+    def _fallback_parse(text: str):
+        normalized = text.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(normalized)
+        except ValueError:
+            return datetime.fromtimestamp(0)
+
+    parser_module.parse = _fallback_parse  # type: ignore[attr-defined]
+    dateutil_module.parser = parser_module  # type: ignore[attr-defined]
+    sys.modules["dateutil"] = dateutil_module
+    sys.modules["dateutil.parser"] = parser_module
+
 from council import interest_score
 
 
@@ -19,6 +40,7 @@ def temp_db(tmp_path, monkeypatch):
         conn.close()
     monkeypatch.setattr(backend_app, "DB_PATH", db_path)
     monkeypatch.setattr(backend_app, "_DB_READY_PATH", None, raising=False)
+    monkeypatch.setattr(backend_app, "DB_REPAIR_DIR", tmp_path / ".db-repair", raising=False)
     return db_path
 
 
@@ -317,6 +339,8 @@ def test_clear_analysis_missing_post_raises(temp_db):
 def test_erase_all_council_analysis_removes_non_summary(temp_db):
     posts = ("post-one", "post-two")
 
+    backend_app.ACTIVE_COUNCIL_JOB_ID = None
+
     with backend_app._connect() as conn:
         for pid in posts:
             conn.execute(
@@ -566,3 +590,75 @@ def test_refresh_summaries_worker_ingests_conversation_hub(temp_db, tmp_path, mo
         ).fetchall()
 
     assert {row["stage"] for row in rows} >= {"summariser"}
+
+
+def test_repair_database_cleans_wal_files(temp_db):
+    wal = temp_db.with_name(f"{temp_db.name}-wal")
+    shm = temp_db.with_name(f"{temp_db.name}-shm")
+    wal.write_text("wal")
+    shm.write_text("shm")
+
+    response = backend_app.repair_database(backend_app.RepairDatabaseRequest())
+
+    assert response.ok is True
+    assert response.wal_cleaned is True
+    assert wal.exists() is False
+    assert shm.exists() is False
+    assert response.needs_reset is False
+
+
+def test_repair_database_detects_corruption_without_reset(temp_db):
+    temp_db.write_text("not a database")
+
+    response = backend_app.repair_database(backend_app.RepairDatabaseRequest())
+
+    assert response.ok is False
+    assert response.needs_reset is True
+    assert response.reset_performed is False
+    assert temp_db.exists()
+
+
+def test_repair_database_can_reset_corrupt_file(temp_db):
+    temp_db.write_text("broken")
+
+    response = backend_app.repair_database(backend_app.RepairDatabaseRequest(allow_reset=True))
+
+    assert response.ok is True
+    assert response.reset_performed is True
+    assert response.needs_reset is False
+
+    with sqlite3.connect(temp_db) as conn:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='posts'",
+        ).fetchone()
+    assert row is not None
+
+
+def test_repair_database_restores_named_backup(temp_db):
+    with sqlite3.connect(temp_db) as conn:
+        conn.execute("INSERT INTO posts (post_id, title) VALUES (?, ?)", ("keep", "Keep me"))
+        conn.commit()
+
+    backup_name = f"{temp_db.stem}.corrupt-20240101T000000Z{temp_db.suffix}"
+    backup_path = temp_db.with_name(backup_name)
+    backup_path.write_bytes(temp_db.read_bytes())
+
+    with sqlite3.connect(temp_db) as conn:
+        conn.execute("DELETE FROM posts")
+        conn.commit()
+
+    response = backend_app.repair_database(
+        backend_app.RepairDatabaseRequest(restore_backup=backup_name),
+    )
+
+    assert response.ok is True
+    assert response.restored_backup == backup_name
+    assert any(entry.name == backup_name for entry in response.backups)
+
+    with sqlite3.connect(temp_db) as conn:
+        restored = conn.execute(
+            "SELECT COUNT(*) FROM posts WHERE post_id = ?",
+            ("keep",),
+        ).fetchone()
+
+    assert restored is not None and restored[0] == 1
