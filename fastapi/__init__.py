@@ -43,6 +43,7 @@ else:
 
     import asyncio
     import inspect
+    import typing as typing_module
     from datetime import date, datetime
     from typing import Any, Callable, Dict, Iterable, List, Optional, Pattern, Tuple, Union
     from typing import get_args, get_origin
@@ -291,7 +292,7 @@ else:
             ]
 
             for name, param in signature.parameters.items():
-                annotation = param.annotation
+                annotation = _resolve_annotation(param.annotation, endpoint)
                 raw: Any = None
                 if name in path_params:
                     raw = path_params[name]
@@ -318,11 +319,20 @@ else:
             return None
 
         async def _send_response(self, send: Callable[[Dict[str, Any]], Any], response: "Response") -> None:
+            status = int(response.status_code)
             body, media_type = _encode_body(response.content, response.media_type)
+
+            if status in {204, 304} or 100 <= status < 200:
+                body = b""
+
             headers = [(b"content-type", media_type.encode("latin-1"))]
             for key, value in response.headers.items():
                 headers.append((key.encode("latin-1"), str(value).encode("latin-1")))
-            await send({"type": "http.response.start", "status": int(response.status_code), "headers": headers})
+
+            if not any(key.lower() == b"content-length" for key, _ in headers):
+                headers.append((b"content-length", str(len(body)).encode("latin-1")))
+
+            await send({"type": "http.response.start", "status": status, "headers": headers})
             await send({"type": "http.response.body", "body": body, "more_body": False})
 
     def _encode_body(content: Any, media_type: Optional[str]) -> Tuple[bytes, str]:
@@ -348,6 +358,34 @@ else:
         if isinstance(result, (dict, list, str, int, float, type(None))):
             return Response(result)
         return Response(str(result))
+
+    def _resolve_annotation(annotation: Any, endpoint: Callable[..., Any]) -> Any:
+        if not isinstance(annotation, str):
+            return annotation
+
+        simple = annotation.strip()
+        module = inspect.getmodule(endpoint)
+        globalns: Dict[str, Any] = {}
+        if module and hasattr(module, "__dict__"):
+            globalns.update(module.__dict__)
+        globalns.setdefault("__builtins__", __builtins__)
+        globalns.setdefault("typing", typing_module)
+
+        try:
+            return eval(annotation, globalns, {})
+        except Exception:
+            simple_map: Dict[str, Any] = {
+                "int": int,
+                "float": float,
+                "str": str,
+                "bool": bool,
+                "datetime": datetime,
+                "date": date,
+                "bytes": bytes,
+                "list": list,
+                "dict": dict,
+            }
+            return simple_map.get(simple, annotation)
 
     def _convert_value(value: Any, annotation: Any) -> Any:
         if value is None:
