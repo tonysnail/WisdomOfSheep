@@ -14,6 +14,7 @@ import {
   getActiveCouncilJob,
   stopCouncilJob,
   repairDatabase,
+  restoreDatabaseFromUpload,
 } from './api'
 import type {
   CouncilJob,
@@ -266,6 +267,10 @@ export default function App() {
   const [repairBackups, setRepairBackups] = useState<DatabaseBackupInfo[]>([])
   const [repairSelectedBackup, setRepairSelectedBackup] = useState('')
   const [repairBusy, setRepairBusy] = useState(false)
+  const [restoreCouncilFile, setRestoreCouncilFile] = useState<File | null>(null)
+  const [restoreConvoFile, setRestoreConvoFile] = useState<File | null>(null)
+  const restoreCouncilInputRef = useRef<HTMLInputElement | null>(null)
+  const restoreConvoInputRef = useRef<HTMLInputElement | null>(null)
   const analyseNewCancelTargetsRef = useRef<{
     refreshId: string | null
     refreshRequested: boolean
@@ -733,6 +738,17 @@ export default function App() {
     })
   }, [repairBackups])
 
+  const clearRestoreFileSelection = useCallback(() => {
+    setRestoreCouncilFile(null)
+    setRestoreConvoFile(null)
+    if (restoreCouncilInputRef.current) {
+      restoreCouncilInputRef.current.value = ''
+    }
+    if (restoreConvoInputRef.current) {
+      restoreConvoInputRef.current.value = ''
+    }
+  }, [])
+
   const handleRepairResult = useCallback(
     (result: RepairDatabaseResponse, contextLabel: string) => {
       setRepairResult(result)
@@ -802,6 +818,30 @@ export default function App() {
     if (!confirmed) return
     void runDatabaseMaintenance({ restoreBackup: repairSelectedBackup }, `Restore backup ${repairSelectedBackup}`)
   }, [repairSelectedBackup, runDatabaseMaintenance])
+
+  const handleRestoreFromUpload = useCallback(async () => {
+    if (!restoreCouncilFile) {
+      appendLogLines(['[Database] Restore from files failed: select a council database file.'])
+      return
+    }
+    setRepairBusy(true)
+    const labelName = restoreCouncilFile.name || 'uploaded file'
+    try {
+      const response = await restoreDatabaseFromUpload(restoreCouncilFile, restoreConvoFile ?? undefined)
+      handleRepairResult(response, `Restore uploaded backup ${labelName}`)
+      clearRestoreFileSelection()
+    } catch (err: any) {
+      appendLogLines([`[Database] Restore from files failed: ${err?.message ?? err}`])
+    } finally {
+      setRepairBusy(false)
+    }
+  }, [
+    restoreCouncilFile,
+    restoreConvoFile,
+    appendLogLines,
+    handleRepairResult,
+    clearRestoreFileSelection,
+  ])
 
   useEffect(() => {
     if (!analyseNewCancelRequested) return undefined
@@ -2048,6 +2088,59 @@ export default function App() {
                 title="Restore the selected backup. The current database is saved before restoring."
               >
                 Restore
+              </button>
+            </div>
+            <div className="database-restore-upload">
+              <span className="database-restore-upload-label">Restore from files</span>
+              <label
+                className={`database-file-input${restoreCouncilFile ? ' selected' : ''}${
+                  repairBusy ? ' disabled' : ''
+                }`}
+              >
+                <input
+                  ref={restoreCouncilInputRef}
+                  type="file"
+                  accept=".sql,.sqlite,.db"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0] ?? null
+                    setRestoreCouncilFile(file)
+                  }}
+                  disabled={repairBusy}
+                />
+                <span className="database-file-input-title">Council</span>
+                <span className="database-file-input-name">
+                  {restoreCouncilFile ? restoreCouncilFile.name : 'Select wisdom_of_sheep.sql'}
+                </span>
+              </label>
+              <label
+                className={`database-file-input${restoreConvoFile ? ' selected' : ''}${
+                  repairBusy ? ' disabled' : ''
+                }`}
+              >
+                <input
+                  ref={restoreConvoInputRef}
+                  type="file"
+                  accept=".sqlite,.db"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0] ?? null
+                    setRestoreConvoFile(file)
+                  }}
+                  disabled={repairBusy}
+                />
+                <span className="database-file-input-title">Conversations</span>
+                <span className="database-file-input-name">
+                  {restoreConvoFile ? restoreConvoFile.name : 'Optional: conversations.sqlite'}
+                </span>
+              </label>
+              <button
+                type="button"
+                onClick={() => {
+                  void handleRestoreFromUpload()
+                }}
+                disabled={repairBusy || !restoreCouncilFile}
+                title="Select a council database backup (and optional conversation store) to restore from local files."
+              >
+                Restore files
               </button>
             </div>
           </div>
