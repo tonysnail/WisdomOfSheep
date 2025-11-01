@@ -2554,9 +2554,14 @@ def get_active_refresh_summaries():
         with JOB_INDEX_LOCK:
             if ACTIVE_JOB_ID == job_id:
                 ACTIVE_JOB_ID = None
-        raise HTTPException(status_code=404, detail="job-not-found")
+        return Response(status_code=204)
 
-    return {"job_id": job_id, "status": job.get("status"), "total": job.get("total"), "done": job.get("done")}
+    return {
+        "job_id": job_id,
+        "status": job.get("status"),
+        "total": job.get("total"),
+        "done": job.get("done"),
+    }
 
 
 @app.post("/api/refresh-summaries/{job_id}/stop")
