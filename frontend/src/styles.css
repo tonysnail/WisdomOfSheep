@@ -418,6 +418,14 @@ details.stage-log pre { margin:8px 0 0; font-size:12px; line-height:1.4; max-hei
 .progress.eta > div { background:linear-gradient(90deg, #ffb347, #ff6a00); }
 .progress.eta.inactive { opacity:0.35; }
 .progress.eta.inactive > div { background:linear-gradient(90deg, rgba(255, 179, 71, 0.6), rgba(255, 106, 0, 0.6)); }
+.progress.council {
+  background:rgba(32, 24, 16, 0.85);
+  border-color:rgba(255, 179, 71, 0.45);
+  box-shadow:inset 0 0 0 1px rgba(255, 140, 0, 0.15);
+}
+.progress.council > div {
+  background:linear-gradient(90deg, #ffb347, #ff6a00);
+}
 .toolbar-row.toolbar-slider { gap:16px; }
 .toolbar-row.toolbar-slider label { font-weight:600; display:flex; align-items:center; gap:6px; transition:color 0.2s ease; }
 .toolbar-row.toolbar-slider label.disabled { color:var(--muted); }
