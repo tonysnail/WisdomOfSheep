@@ -96,16 +96,31 @@ else:
         return default
 
     class _Route:
-        def __init__(self, path: str, methods: Iterable[str], endpoint: Callable[..., Any]) -> None:
+        def __init__(
+            self,
+            path: str,
+            methods: Iterable[str],
+            endpoint: Callable[..., Any],
+            order: int,
+        ) -> None:
             self.path = path
             self.methods = {m.upper() for m in methods}
             self.endpoint = endpoint
-            self.regex, self.param_names = self._compile_path(path)
+            self.order = order
+            (
+                self.regex,
+                self.param_names,
+                self.dynamic_segments,
+                self.static_length,
+            ) = self._compile_path(path)
 
         @staticmethod
-        def _compile_path(path: str) -> Tuple[Pattern[str], List[str]]:
+        def _compile_path(path: str) -> Tuple[Pattern[str], List[str], int, int]:
             param_pattern = re.compile(r"{([^}]+)}")
             params: List[str] = []
+            segments = [segment for segment in path.strip("/").split("/") if segment]
+            dynamic_segments = 0
+            static_length = 0
 
             def replacer(match: re.Match[str]) -> str:
                 raw = match.group(1)
@@ -114,12 +129,22 @@ else:
                 else:
                     name, conv = raw, ""
                 params.append(name)
+                nonlocal dynamic_segments
+                dynamic_segments += 1
                 if conv == "path":
                     return rf"(?P<{name}>.+)"
                 return rf"(?P<{name}>[^/]+)"
 
             regex_pattern = "^" + param_pattern.sub(replacer, path.rstrip("/")) + "/*$"
-            return re.compile(regex_pattern), params
+            if segments:
+                static_length = sum(len(segment) for segment in segments if "{" not in segment)
+            return re.compile(regex_pattern), params, dynamic_segments, static_length
+
+        @property
+        def priority(self) -> Tuple[int, int, int]:
+            # Prefer static routes (fewer dynamic segments), then longer static matches.
+            # Fall back to registration order for stability.
+            return (self.dynamic_segments, -self.static_length, self.order)
 
         def match(self, method: str, url_path: str) -> Optional[Dict[str, str]]:
             if method.upper() not in self.methods:
@@ -149,7 +174,7 @@ else:
 
         def _register(self, path: str, methods: Iterable[str]) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
             def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-                self.routes.append(_Route(path, methods, func))
+                self.routes.append(_Route(path, methods, func, len(self.routes)))
                 return func
 
             return decorator
@@ -215,18 +240,25 @@ else:
                 except json.JSONDecodeError:
                     json_body = body_bytes
 
-            match = None
+            best_match: Optional[Tuple[_Route, Dict[str, str]]] = None
+            best_priority: Optional[Tuple[int, int, int]] = None
             for route in self.routes:
                 params = route.match(method, path)
-                if params is not None:
-                    match = (route, params)
-                    break
+                if params is None:
+                    continue
+                if best_match is None:
+                    best_match = (route, params)
+                    best_priority = route.priority
+                    continue
+                if best_priority is not None and route.priority < best_priority:
+                    best_match = (route, params)
+                    best_priority = route.priority
 
-            if not match:
+            if not best_match:
                 await self._send_response(send, Response({"detail": "Not Found"}, status_code=404))
                 return
 
-            route, path_params = match
+            route, path_params = best_match
 
             try:
                 kwargs = self._build_kwargs(route.endpoint, path_params, query_params, json_body)
