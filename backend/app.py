@@ -198,6 +198,41 @@ def _norm_optional_str(value: Any) -> Optional[str]:
         return None
     return text or None
 
+
+def _serialize_job_payload(job_id: str, job: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a serialisable view of a job with derived fields."""
+
+    data = dict(job)
+    data.setdefault("id", job_id)
+    data.setdefault("job_id", job_id)
+
+    total = 0
+    done = 0
+    try:
+        total = int(data.get("total", 0) or 0)
+    except (TypeError, ValueError):  # noqa: BLE001
+        total = 0
+    try:
+        done = int(data.get("done", 0) or 0)
+    except (TypeError, ValueError):  # noqa: BLE001
+        done = 0
+
+    phase = str(data.get("phase", "") or "").strip()
+    current = str(data.get("current", "") or "").strip()
+
+    message = ""
+    if total > 0:
+        message = f"{phase} {done}/{total}".strip()
+        if current:
+            message = f"{message} — {current}".strip()
+    data["message"] = message
+
+    log_tail = data.get("log_tail")
+    if not isinstance(log_tail, list):
+        data["log_tail"] = []
+
+    return data
+
 COUNCIL_TIME_MODEL = CouncilTimeModel(TIME_MODEL_PATH)
 
 # ================
@@ -2542,12 +2577,7 @@ def get_active_refresh_summaries():
                 ACTIVE_JOB_ID = None
         return Response(status_code=204)
 
-    return {
-        "job_id": job_id,
-        "status": job.get("status"),
-        "total": job.get("total"),
-        "done": job.get("done"),
-    }
+    return _serialize_job_payload(job_id, job)
 
 
 @app.get("/api/refresh-summaries/{job_id}")
@@ -2555,13 +2585,7 @@ def get_refresh_summaries(job_id: str):
     job = _load_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job-not-found")
-    # return a copy with computed message
-    msg = ""
-    if job.get("total", 0) > 0:
-        msg = f'{job.get("phase", "")} {job.get("done", 0)}/{job.get("total", 0)} — {job.get("current", "")}'
-    data = dict(job)
-    data["message"] = msg.strip()
-    return data
+    return _serialize_job_payload(job_id, job)
 
 
 @app.post("/api/refresh-summaries/{job_id}/stop")
