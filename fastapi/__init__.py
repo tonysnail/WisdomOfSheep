@@ -7,7 +7,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Pattern, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Pattern, Tuple, Union
 
 
 def _load_real_fastapi():
@@ -41,6 +41,28 @@ else:
         "Response",
     ]
 
+    import asyncio
+    import inspect
+    from datetime import date, datetime
+    from typing import Any, Callable, Dict, Iterable, List, Optional, Pattern, Tuple, Union
+    from typing import get_args, get_origin
+    from urllib.parse import parse_qs
+
+    try:  # pragma: no cover - optional dependency when running tests without pydantic
+        from pydantic import BaseModel
+    except Exception:  # noqa: BLE001
+        class BaseModel:  # type: ignore[override]
+            def __init__(self, **data: Any) -> None:
+                for key, value in data.items():
+                    setattr(self, key, value)
+
+            def model_dump(self) -> Dict[str, Any]:
+                return dict(self.__dict__)
+
+            @classmethod
+            def parse_obj(cls, data: Any) -> "BaseModel":
+                return cls(**data)
+
     class HTTPException(Exception):
         def __init__(self, status_code: int, detail: Any = None) -> None:
             super().__init__(detail)
@@ -48,9 +70,17 @@ else:
             self.detail = detail
 
     class Response:
-        def __init__(self, content: Any = None, status_code: int = 200) -> None:
+        def __init__(
+            self,
+            content: Any = None,
+            status_code: int = 200,
+            media_type: str = "application/json",
+            headers: Optional[Dict[str, str]] = None,
+        ) -> None:
             self.content = content
             self.status_code = int(status_code)
+            self.media_type = media_type
+            self.headers = dict(headers or {})
 
         def json(self) -> Any:
             if isinstance(self.content, (bytes, bytearray)):
@@ -59,10 +89,10 @@ else:
                 return json.loads(self.content)
             return self.content
 
-    def Body(*_: Any, default: Any = None, **__: Any) -> Any:
+    def Body(*_: Any, default: Any = None, **__: Any) -> Any:  # pragma: no cover - metadata ignored
         return default
 
-    def Query(*_: Any, default: Any = None, **__: Any) -> Any:
+    def Query(*_: Any, default: Any = None, **__: Any) -> Any:  # pragma: no cover - metadata ignored
         return default
 
     class _Route:
@@ -105,8 +135,9 @@ else:
             self.version = version
             self.routes: List[_Route] = []
             self._event_handlers: Dict[str, List[Callable[[], Any]]] = {"startup": [], "shutdown": []}
+            self._startup_complete = asyncio.Event()
 
-        def add_middleware(self, *_: Any, **__: Any) -> None:  # pragma: no cover - trivial stub
+        def add_middleware(self, *_: Any, **__: Any) -> None:  # pragma: no cover - middleware ignored in stub
             return None
 
         def on_event(self, event: str) -> Callable[[Callable[[], Any]], Callable[[], Any]]:
@@ -136,6 +167,145 @@ else:
             for handler in self._event_handlers.get(event, []):
                 handler()
 
+        def __call__(self, scope: Dict[str, Any]) -> Callable[[Callable[..., Any], Callable[..., Any]], Any]:
+            async def app(receive: Callable[[], Any], send: Callable[[Dict[str, Any]], Any]) -> None:
+                await self._ensure_startup()
+                await self._handle_request(scope, receive, send)
+
+            return app
+
+        async def _ensure_startup(self) -> None:
+            if not self._startup_complete.is_set():
+                self.run_event("startup")
+                self._startup_complete.set()
+
+        async def _handle_request(
+            self,
+            scope: Dict[str, Any],
+            receive: Callable[[], Any],
+            send: Callable[[Dict[str, Any]], Any],
+        ) -> None:
+            if scope.get("type") != "http":
+                await self._send_response(send, Response({"detail": "Unsupported scope"}, status_code=500))
+                return
+
+            method = scope.get("method", "GET").upper()
+            path = scope.get("path", "")
+            query_bytes = scope.get("query_string", b"")
+            query_str = query_bytes.decode("utf-8", errors="ignore")
+            raw_query = parse_qs(query_str, keep_blank_values=True)
+            query_params: Dict[str, Any] = {
+                key: values if len(values) > 1 else values[0]
+                for key, values in raw_query.items()
+            }
+
+            body_bytes = b""
+            while True:
+                message = await receive()
+                if message.get("type") != "http.request":
+                    continue
+                body_bytes += message.get("body", b"")
+                if not message.get("more_body"):
+                    break
+
+            json_body: Any = None
+            if body_bytes:
+                try:
+                    json_body = json.loads(body_bytes.decode("utf-8"))
+                except json.JSONDecodeError:
+                    json_body = body_bytes
+
+            match = None
+            for route in self.routes:
+                params = route.match(method, path)
+                if params is not None:
+                    match = (route, params)
+                    break
+
+            if not match:
+                await self._send_response(send, Response({"detail": "Not Found"}, status_code=404))
+                return
+
+            route, path_params = match
+
+            try:
+                kwargs = self._build_kwargs(route.endpoint, path_params, query_params, json_body)
+                result = route.endpoint(**kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
+            except HTTPException as exc:
+                await self._send_response(send, Response({"detail": exc.detail}, status_code=exc.status_code))
+                return
+            except Exception as exc:  # noqa: BLE001
+                await self._send_response(send, Response({"detail": str(exc)}, status_code=500))
+                return
+
+            response = _prepare_content(result)
+            await self._send_response(send, response)
+
+        def _build_kwargs(
+            self,
+            endpoint: Callable[..., Any],
+            path_params: Dict[str, str],
+            query_params: Dict[str, Any],
+            json_body: Any,
+        ) -> Dict[str, Any]:
+            signature = inspect.signature(endpoint)
+            kwargs: Dict[str, Any] = {}
+            body_candidates = [
+                name
+                for name in signature.parameters
+                if name not in path_params and name not in query_params
+            ]
+
+            for name, param in signature.parameters.items():
+                annotation = param.annotation
+                raw: Any = None
+                if name in path_params:
+                    raw = path_params[name]
+                elif name in query_params:
+                    raw = query_params[name]
+                else:
+                    raw = self._extract_body_value(name, body_candidates, json_body)
+                    if raw is None and param.default is not inspect._empty:
+                        raw = param.default
+                kwargs[name] = _convert_value(raw, annotation)
+            return kwargs
+
+        def _extract_body_value(self, name: str, candidates: List[str], json_body: Any) -> Any:
+            if json_body is None:
+                return None
+            if isinstance(json_body, dict):
+                if name in json_body:
+                    return json_body[name]
+                if len(candidates) == 1 and candidates[0] == name:
+                    return json_body
+                return None
+            if len(candidates) == 1 and candidates[0] == name:
+                return json_body
+            return None
+
+        async def _send_response(self, send: Callable[[Dict[str, Any]], Any], response: "Response") -> None:
+            body, media_type = _encode_body(response.content, response.media_type)
+            headers = [(b"content-type", media_type.encode("latin-1"))]
+            for key, value in response.headers.items():
+                headers.append((key.encode("latin-1"), str(value).encode("latin-1")))
+            await send({"type": "http.response.start", "status": int(response.status_code), "headers": headers})
+            await send({"type": "http.response.body", "body": body, "more_body": False})
+
+    def _encode_body(content: Any, media_type: Optional[str]) -> Tuple[bytes, str]:
+        if isinstance(content, Response):  # pragma: no cover - defensive
+            return _encode_body(content.content, content.media_type)
+        if isinstance(content, (bytes, bytearray)):
+            return bytes(content), media_type or "application/octet-stream"
+        if isinstance(content, str):
+            return content.encode("utf-8"), media_type or "text/plain; charset=utf-8"
+        if isinstance(content, (dict, list)):
+            return json.dumps(content).encode("utf-8"), media_type or "application/json"
+        if content is None:
+            return b"null", media_type or "application/json"
+        return str(content).encode("utf-8"), media_type or "text/plain; charset=utf-8"
+
     def _prepare_content(result: Any) -> Response:
         if isinstance(result, Response):
             return result
@@ -146,3 +316,65 @@ else:
         if isinstance(result, (dict, list, str, int, float, type(None))):
             return Response(result)
         return Response(str(result))
+
+    def _convert_value(value: Any, annotation: Any) -> Any:
+        if value is None:
+            return None
+        if annotation is inspect._empty or annotation is Any:
+            return value
+
+        origin = get_origin(annotation)
+        args = get_args(annotation)
+
+        if origin is Union:  # type: ignore[name-defined]
+            non_none = [arg for arg in args if arg is not type(None)]  # noqa: E721
+            if value is None:
+                return None
+            for candidate in non_none:
+                try:
+                    return _convert_value(value, candidate)
+                except Exception:  # noqa: BLE001
+                    continue
+            return value
+
+        if inspect.isclass(annotation) and issubclass(annotation, BaseModel):  # type: ignore[arg-type]
+            if isinstance(value, annotation):
+                return value
+            if hasattr(annotation, "model_validate"):
+                return annotation.model_validate(value)  # type: ignore[return-value]
+            if hasattr(annotation, "parse_obj"):
+                return annotation.parse_obj(value)  # type: ignore[return-value]
+            return annotation(**value)
+
+        if origin in {list, List, Iterable, tuple, set}:  # type: ignore[arg-type]
+            item_type = args[0] if args else Any
+            if not isinstance(value, (list, tuple, set)):
+                value = [value]
+            converted = [_convert_value(item, item_type) for item in value]
+            if origin is tuple:
+                return tuple(converted)
+            if origin is set:
+                return set(converted)
+            return list(converted)
+
+        if annotation in {str, int, float}:
+            return annotation(value)
+
+        if annotation is bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                return value.strip().lower() not in {"", "0", "false", "no"}
+            return bool(value)
+
+        if annotation in {datetime, date}:
+            if isinstance(value, (datetime, date)):
+                return value
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return None
+                if annotation is datetime and text.endswith("Z"):
+                    text = text[:-1] + "+00:00"
+                return annotation.fromisoformat(text)  # type: ignore[return-value]
+        return value
