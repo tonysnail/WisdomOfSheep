@@ -12,8 +12,8 @@ import logging
 import os
 import random
 import re
-import sys
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -32,7 +32,6 @@ PARENT_DIR = CURRENT_DIR.parent
 PARENT_DIR_STR = str(PARENT_DIR)
 if PARENT_DIR_STR not in sys.path:
     sys.path.insert(0, PARENT_DIR_STR)
-
 
 from backend import utils
 from backend.council_time import CouncilTimeModel, approximate_token_count
