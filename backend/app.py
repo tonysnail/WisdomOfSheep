@@ -744,6 +744,47 @@ def _oracle_join(base_url: str, path: str) -> str:
 # =========================
 # Endpoints
 # =========================
+def _process_oracle_health_response(
+    job_id: str,
+    response: Optional[requests.Response],
+) -> bool:
+    """Handle the Oracle /healthz response.
+
+    Returns True when the worker should continue, False when it should stop.
+    """
+
+    if response is None:
+        return False
+
+    status = getattr(response, "status_code", None)
+    if status is None:
+        return False
+
+    if status >= 400:
+        if status in {404, 405}:
+            _job_append_log(
+                job_id,
+                f"⚠ Oracle /healthz returned {status}; skipping health check",
+            )
+            return True
+
+        _job_append_log(job_id, f"✗ Oracle /healthz returned {status}")
+        _job_update_fields(
+            job_id,
+            status="error",
+            error=f"oracle-healthz-{status}",
+            oracle_status="error",
+            phase="",
+            current="",
+            oracle_poll_seconds=None,
+            oracle_idle_since=None,
+            ended_at=time.time(),
+        )
+        return False
+
+    return True
+
+
 def _worker_refresh_summaries(job_id: str):
     global ACTIVE_JOB_ID
     job = _load_job(job_id)
@@ -1197,22 +1238,7 @@ def _worker_refresh_summaries(job_id: str):
             oracle_idle_since=None,
         )
 
-        health_resp = _request("/healthz")
-        if health_resp is None:
-            return
-        if health_resp.status_code >= 400:
-            _job_append_log(job_id, f"✗ Oracle /healthz returned {health_resp.status_code}")
-            _job_update_fields(
-                job_id,
-                status="error",
-                error=f"oracle-healthz-{health_resp.status_code}",
-                oracle_status="error",
-                phase="",
-                current="",
-                oracle_poll_seconds=None,
-                oracle_idle_since=None,
-                ended_at=time.time(),
-            )
+        if not _process_oracle_health_response(job_id, _request("/healthz")):
             return
 
         _job_update_fields(
