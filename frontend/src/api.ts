@@ -181,6 +181,22 @@ export async function repairDatabase(options?: RepairDatabaseOptions): Promise<R
   return json(res)
 }
 
+export async function restoreDatabaseFromUpload(
+  councilFile: File,
+  conversationFile?: File,
+): Promise<RepairDatabaseResponse> {
+  const formData = new FormData()
+  formData.append('council_backup', councilFile, councilFile.name)
+  if (conversationFile) {
+    formData.append('conversation_backup', conversationFile, conversationFile.name)
+  }
+  const res = await fetch(`${API}/api/database/restore-upload`, {
+    method: 'POST',
+    body: formData,
+  })
+  return json(res)
+}
+
 export type RefreshSummariesMode = 'full' | 'new_only'
 
 export async function startRefreshSummaries(options?: {
