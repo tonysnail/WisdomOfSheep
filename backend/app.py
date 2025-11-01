@@ -2031,8 +2031,6 @@ def _worker_council_analysis(job_id: str) -> None:
 
     queue = list(job.get("queue") or [])
     total = int(job.get("total") or len(queue))
-    active_post_id: Optional[str] = None
-    active_post_cleared_on_cancel = False
     _job_update_fields(
         job_id,
         status="running",
@@ -2040,25 +2038,11 @@ def _worker_council_analysis(job_id: str) -> None:
         remaining=len(queue),
     )
 
-    def _ensure_not_cancelled(current_post: Optional[str] = None) -> bool:
-        nonlocal active_post_cleared_on_cancel
+    def _ensure_not_cancelled() -> bool:
         current = _load_job(job_id)
         if not current:
             return False
         if current.get("cancelled"):
-            if current_post and not active_post_cleared_on_cancel:
-                try:
-                    _job_append_log(job_id, f"⚠ clearing partial council analysis for {current_post}")
-                    clear_post_analysis(current_post)
-                    _job_append_log(job_id, f"✓ cleared partial council analysis for {current_post}")
-                except HTTPException as exc:
-                    detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
-                    _job_append_log(job_id, f"✗ partial council cleanup failed {current_post}: {detail}")
-                except Exception as exc:  # noqa: BLE001
-                    message = str(exc) or repr(exc)
-                    _job_append_log(job_id, f"✗ partial council cleanup failed {current_post}: {message}")
-                finally:
-                    active_post_cleared_on_cancel = True
             _job_append_log(job_id, "⚠ council analysis cancelled by user")
             _job_update_fields(
                 job_id,
@@ -2077,12 +2061,10 @@ def _worker_council_analysis(job_id: str) -> None:
 
     try:
         for index, entry in enumerate(queue):
-            post_id = str(entry.get("post_id") or "")
-            active_post_id = post_id or None
-            active_post_cleared_on_cancel = False
-            if not _ensure_not_cancelled(active_post_id):
+            if not _ensure_not_cancelled():
                 return
 
+            post_id = str(entry.get("post_id") or "")
             title = str(entry.get("title") or "")
             score = entry.get("interest_score")
             mode = str(entry.get("mode") or "interest")
@@ -2156,7 +2138,7 @@ def _worker_council_analysis(job_id: str) -> None:
 
             stage_ok = True
             for stage in COUNCIL_ANALYSIS_SEQUENCE:
-                if not _ensure_not_cancelled(post_id):
+                if not _ensure_not_cancelled():
                     return
                 label = _council_stage_label(stage)
                 _job_append_log(job_id, f"→ {label} for {post_id}")
@@ -2202,8 +2184,6 @@ def _worker_council_analysis(job_id: str) -> None:
                 current_article_tokens=None,
                 current_summary_tokens=None,
             )
-            active_post_id = None
-            active_post_cleared_on_cancel = False
 
         _job_update_fields(
             job_id,
