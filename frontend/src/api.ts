@@ -22,6 +22,26 @@ async function json<T>(res: Response): Promise<T> {
   return res.json() as Promise<T>
 }
 
+async function readFileAsBase64(file: File): Promise<string> {
+  const dataUrl: string = await new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const result = reader.result
+      if (typeof result !== 'string') {
+        reject(new Error('Unexpected file reader result'))
+        return
+      }
+      resolve(result)
+    }
+    reader.onerror = () => {
+      reject(reader.error ?? new Error('Failed to read file'))
+    }
+    reader.readAsDataURL(file)
+  })
+  const commaIndex = dataUrl.indexOf(',')
+  return commaIndex >= 0 ? dataUrl.slice(commaIndex + 1) : dataUrl
+}
+
 export type ListPostsParams = {
   q?: string
   platform?: string
@@ -174,6 +194,30 @@ export async function repairDatabase(options?: RepairDatabaseOptions): Promise<R
     payload.restore_backup = options.restoreBackup
   }
   const res = await fetch(`${API}/api/database/repair`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  return json(res)
+}
+
+export async function restoreDatabaseFromUpload(
+  councilFile: File,
+  conversationFile?: File,
+): Promise<RepairDatabaseResponse> {
+  const [councilData, conversationData] = await Promise.all([
+    readFileAsBase64(councilFile),
+    conversationFile ? readFileAsBase64(conversationFile) : Promise.resolve(null),
+  ])
+  const payload: Record<string, unknown> = {
+    council_name: councilFile.name,
+    council_data: councilData,
+  }
+  if (conversationFile && conversationData) {
+    payload.conversation_name = conversationFile.name
+    payload.conversation_data = conversationData
+  }
+  const res = await fetch(`${API}/api/database/restore-upload`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),

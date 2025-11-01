@@ -38,9 +38,14 @@ def temp_db(tmp_path, monkeypatch):
         backend_app._ensure_schema(conn)
     finally:
         conn.close()
+    convo_path = tmp_path / "test_conversations.sqlite"
+    with sqlite3.connect(convo_path) as convo_conn:
+        convo_conn.execute("CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY, value TEXT)")
+        convo_conn.commit()
     monkeypatch.setattr(backend_app, "DB_PATH", db_path)
     monkeypatch.setattr(backend_app, "_DB_READY_PATH", None, raising=False)
     monkeypatch.setattr(backend_app, "DB_REPAIR_DIR", tmp_path / ".db-repair", raising=False)
+    monkeypatch.setattr(backend_app, "CONVO_STORE_PATH", convo_path)
     return db_path
 
 
@@ -662,3 +667,39 @@ def test_repair_database_restores_named_backup(temp_db):
         ).fetchone()
 
     assert restored is not None and restored[0] == 1
+
+
+def test_restore_database_from_uploaded_files(temp_db, tmp_path):
+    uploaded_db = tmp_path / "uploaded_wisdom_of_sheep.sql"
+    with sqlite3.connect(uploaded_db) as conn:
+        backend_app._ensure_schema(conn)
+        conn.execute("INSERT INTO posts (post_id, title) VALUES (?, ?)", ("restored", "Restored post"))
+        conn.commit()
+
+    uploaded_convo = tmp_path / "uploaded_conversations.sqlite"
+    with sqlite3.connect(uploaded_convo) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT INTO meta (value) VALUES (?)", ("conversation backup",))
+        conn.commit()
+
+    with uploaded_db.open("rb") as council_source, uploaded_convo.open("rb") as convo_source:
+        response = backend_app._restore_database_from_sources(
+            council_source,
+            uploaded_db.name,
+            convo_source,
+            uploaded_convo.name,
+        )
+
+    assert response.ok is True
+    assert response.restored_backup == uploaded_db.name
+    assert any("Restored conversation store" in action for action in response.actions)
+
+    with sqlite3.connect(temp_db) as conn:
+        row = conn.execute("SELECT title FROM posts WHERE post_id = ?", ("restored",)).fetchone()
+
+    assert row is not None and row[0] == "Restored post"
+
+    with sqlite3.connect(backend_app.CONVO_STORE_PATH) as conn:
+        convo_row = conn.execute("SELECT value FROM meta").fetchone()
+
+    assert convo_row is not None and convo_row[0] == "conversation backup"

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import contextlib
 import io
 import json
@@ -23,7 +25,7 @@ import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Callable, Literal
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Callable, Literal, BinaryIO
 
 from urllib.parse import urljoin
 
@@ -35,7 +37,10 @@ if str(ROOT) not in sys.path:
 COUNCIL_FAILURES_PATH = ROOT / "council_failures.json"
 COUNCIL_FAILURES_LOCK = threading.Lock()
 
-from fastapi import Body, FastAPI, HTTPException, Query, Response
+try:  # pragma: no cover - exercised when real FastAPI is unavailable in tests
+    from fastapi import Body, FastAPI, HTTPException, Query, Response
+except ImportError:  # pragma: no cover - fallback for lightweight stub
+    from fastapi import Body, FastAPI, HTTPException, Query, Response  # type: ignore[assignment]
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from fastapi.encoders import jsonable_encoder
@@ -285,6 +290,47 @@ def _run_integrity_check(path: Path, actions: List[str], warnings: List[str]) ->
         return False
 
 
+def _finalise_repair_response(
+    *,
+    message: str,
+    actions: List[str],
+    warnings: List[str],
+    reset_performed: bool,
+    restored_backup: Optional[str],
+    backup_path: Optional[str],
+    wal_cleaned: bool,
+    integrity_ok: Optional[bool],
+    needs_reset: bool,
+) -> "RepairDatabaseResponse":
+    with _DB_READY_LOCK:
+        _DB_READY_PATH = None
+
+    if integrity_ok:
+        try:
+            _ensure_database_ready()
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("database repair follow-up ensure failed")
+
+    updated_backups = _list_db_backups()
+    backups_model = [DatabaseBackupEntry(**entry) for entry in updated_backups]
+
+    ok = bool(integrity_ok and not needs_reset)
+
+    return RepairDatabaseResponse(
+        ok=ok,
+        message=message or "",
+        actions=actions,
+        warnings=warnings,
+        reset_performed=reset_performed,
+        restored_backup=restored_backup,
+        backup_path=backup_path,
+        wal_cleaned=wal_cleaned,
+        integrity_ok=integrity_ok,
+        needs_reset=needs_reset,
+        backups=backups_model,
+    )
+
+
 _DB_READY_LOCK = threading.Lock()
 _DB_READY_PATH: Path | None = None
 DB_MAINTENANCE_LOCK = threading.Lock()
@@ -404,23 +450,8 @@ def _perform_database_repair(payload: RepairDatabaseRequest) -> RepairDatabaseRe
                     reset_performed = True
                     message = "Corrupt database reset to a new empty file."
 
-    with _DB_READY_LOCK:
-        _DB_READY_PATH = None
-
-    if integrity_ok:
-        try:
-            _ensure_database_ready()
-        except Exception:  # noqa: BLE001
-            LOGGER.exception("database repair follow-up ensure failed")
-
-    updated_backups = _list_db_backups()
-    backups_model = [DatabaseBackupEntry(**entry) for entry in updated_backups]
-
-    ok = bool(integrity_ok and not needs_reset)
-
-    return RepairDatabaseResponse(
-        ok=ok,
-        message=message or "",
+    return _finalise_repair_response(
+        message=message,
         actions=actions,
         warnings=warnings,
         reset_performed=reset_performed,
@@ -429,7 +460,122 @@ def _perform_database_repair(payload: RepairDatabaseRequest) -> RepairDatabaseRe
         wal_cleaned=wal_cleaned,
         integrity_ok=integrity_ok,
         needs_reset=needs_reset,
-        backups=backups_model,
+    )
+
+
+def _extract_base64_payload(raw: str) -> str:
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if "," in text and "base64" in text.partition(",")[0]:
+        return text.partition(",")[2]
+    return text
+
+
+def _decode_upload_bytes(data: str, context: str) -> io.BytesIO:
+    payload = _extract_base64_payload(data)
+    if not payload:
+        raise HTTPException(status_code=400, detail=f"missing-{context}")
+    try:
+        blob = base64.b64decode(payload.encode("utf-8"), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid-{context}") from exc
+    return io.BytesIO(blob)
+
+
+def _restore_database_from_sources(
+    council_source: BinaryIO,
+    council_name: str,
+    conversation_source: BinaryIO | None = None,
+    conversation_name: Optional[str] = None,
+) -> RepairDatabaseResponse:
+    DB_REPAIR_DIR.mkdir(parents=True, exist_ok=True)
+    path = Path(DB_PATH)
+    actions: List[str] = []
+    warnings: List[str] = []
+    wal_cleaned = False
+    backup_path: Optional[str] = None
+    needs_reset = False
+
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+    if path.exists():
+        existing_wal = _wal_files(path)
+        backup_file = path.with_name(f"{path.stem}.restore-{timestamp}{path.suffix}")
+        shutil.copyfile(path, backup_file)
+        actions.append(f"Backed up current database to {backup_file.name}")
+        backup_path = str(backup_file)
+        _handle_wal_files(path, backup_file)
+        if existing_wal:
+            wal_cleaned = True
+            actions.append(f"Captured {len(existing_wal)} WAL/SHM file(s) alongside backup")
+    else:
+        actions.append("No existing database file to back up before restore")
+
+    _handle_wal_files(path, None)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        council_source.seek(0)
+    except (OSError, AttributeError):
+        pass
+    with path.open("wb") as dest:
+        shutil.copyfileobj(council_source, dest)
+
+    display_name = Path(council_name).name if council_name else "uploaded file"
+    actions.append(f"Restored uploaded backup {display_name}")
+
+    _handle_wal_files(path, None)
+    integrity_actions: List[str] = []
+    integrity_warnings: List[str] = []
+    integrity_ok = _run_integrity_check(path, integrity_actions, integrity_warnings)
+    actions.extend(integrity_actions)
+    warnings.extend(integrity_warnings)
+
+    if integrity_ok:
+        message = f"Uploaded backup {display_name} restored successfully."
+    else:
+        message = f"Uploaded backup {display_name} restored but integrity check failed."
+        needs_reset = True
+
+    if conversation_source is not None:
+        conversation_path = Path(CONVO_STORE_PATH)
+        conversation_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            conversation_source.seek(0)
+        except (OSError, AttributeError):
+            pass
+        if conversation_path.exists():
+            convo_backup = conversation_path.with_name(
+                f"{conversation_path.stem}.restore-{timestamp}{conversation_path.suffix}"
+            )
+            shutil.copyfile(conversation_path, convo_backup)
+            actions.append(f"Backed up current conversation store to {convo_backup.name}")
+            _handle_wal_files(conversation_path, convo_backup)
+        else:
+            actions.append("No existing conversation store to back up before restore")
+        _handle_wal_files(conversation_path, None)
+        with conversation_path.open("wb") as dest:
+            shutil.copyfileobj(conversation_source, dest)
+        convo_display = Path(conversation_name).name if conversation_name else "uploaded file"
+        actions.append(f"Restored conversation store from {convo_display}")
+        convo_actions: List[str] = []
+        convo_warnings: List[str] = []
+        convo_ok = _run_integrity_check(conversation_path, convo_actions, convo_warnings)
+        actions.extend(f"conversation:{entry}" for entry in convo_actions)
+        warnings.extend(f"conversation:{entry}" for entry in convo_warnings)
+        if not convo_ok:
+            warnings.append("conversation:Integrity check failed after restore.")
+
+    return _finalise_repair_response(
+        message=message,
+        actions=actions,
+        warnings=warnings,
+        reset_performed=False,
+        restored_backup=display_name,
+        backup_path=backup_path,
+        wal_cleaned=wal_cleaned,
+        integrity_ok=integrity_ok,
+        needs_reset=needs_reset,
     )
 
 
@@ -814,6 +960,13 @@ class RunStageResponse(BaseModel):
 class RepairDatabaseRequest(BaseModel):
     allow_reset: bool = False
     restore_backup: Optional[str] = None
+
+
+class RestoreDatabaseUploadPayload(BaseModel):
+    council_name: Optional[str] = None
+    council_data: str
+    conversation_name: Optional[str] = None
+    conversation_data: Optional[str] = None
 
 
 class DatabaseBackupEntry(BaseModel):
@@ -4223,6 +4376,26 @@ def repair_database(payload: RepairDatabaseRequest | None = Body(default=None)) 
     request = payload or RepairDatabaseRequest()
     with DB_MAINTENANCE_LOCK:
         result = _perform_database_repair(request)
+    return result
+
+
+@app.post("/api/database/restore-upload", response_model=RepairDatabaseResponse)
+def restore_database_upload(payload: RestoreDatabaseUploadPayload | None = Body(default=None)) -> RepairDatabaseResponse:
+    if payload is None:
+        raise HTTPException(status_code=400, detail="missing-payload")
+
+    council_stream = _decode_upload_bytes(payload.council_data, "council-data")
+    conversation_stream: Optional[io.BytesIO] = None
+    if payload.conversation_data:
+        conversation_stream = _decode_upload_bytes(payload.conversation_data, "conversation-data")
+
+    with DB_MAINTENANCE_LOCK:
+        result = _restore_database_from_sources(
+            council_stream,
+            payload.council_name or "uploaded file",
+            conversation_stream,
+            payload.conversation_name,
+        )
     return result
 
 
