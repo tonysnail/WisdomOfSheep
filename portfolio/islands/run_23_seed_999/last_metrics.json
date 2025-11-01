@@ -1,0 +1,17 @@
+{
+  "trades": 7,
+  "total_pnl": 2588.7859571751655,
+  "win_rate": 1.0,
+  "cagr": 0.5285632263030692,
+  "sharpe": 5.0,
+  "sortino": 0.0,
+  "profit_factor": 10.0,
+  "max_dd": 0.0,
+  "calmar": Infinity,
+  "vol": 0.021421897345058057,
+  "expectancy": 369.8265653107379,
+  "end_equity": 102588.78595717518,
+  "mean_pretrade_score": 1.4742857142857144,
+  "watchout_hits": 0.0,
+  "score": 0.409499677262961
+}
