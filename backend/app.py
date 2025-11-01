@@ -177,14 +177,34 @@ def _initialize_db_file(target: Path) -> None:
 
 
 def _is_db_healthy(path: Path) -> bool:
-    try:
-        with sqlite3.connect(str(path)) as conn:
+    def _quick_check(db_path: Path) -> Optional[str]:
+        with sqlite3.connect(str(db_path)) as conn:
             row = conn.execute("PRAGMA quick_check").fetchone()
+        if not row:
+            return None
+        return str(row[0]).strip().lower()
+
+    try:
+        result = _quick_check(path)
     except sqlite3.DatabaseError:
+        wal = path.with_name(f"{path.name}-wal")
+        shm = path.with_name(f"{path.name}-shm")
+        if wal.exists() or shm.exists():
+            LOGGER.warning(
+                "council database at %s had leftover WAL/SHM files; pruning and retrying integrity check",
+                path,
+            )
+            _handle_wal_files(path, None)
+            try:
+                result = _quick_check(path)
+            except sqlite3.DatabaseError:
+                return False
+        else:
+            return False
+
+    if result is None:
         return False
-    if not row:
-        return False
-    return str(row[0]).strip().lower() == "ok"
+    return result == "ok"
 
 
 def _backup_corrupt_db(path: Path) -> Path | None:
