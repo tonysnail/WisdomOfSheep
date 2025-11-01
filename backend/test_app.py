@@ -635,3 +635,33 @@ def test_refresh_summaries_active_returns_payload(tmp_path, monkeypatch):
     assert data["done"] == 2
     assert data["log_tail"] == ["line"]
     assert data["message"].startswith("processing 2/5")
+
+
+def test_council_active_returns_204_when_missing_job(tmp_path, monkeypatch):
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+
+    job_id = "council-missing"
+    monkeypatch.setattr(backend_app, "JOBS_DIR", jobs_dir, raising=False)
+    monkeypatch.setattr(backend_app, "ACTIVE_COUNCIL_JOB_ID", job_id, raising=False)
+
+    response = backend_app.get_active_council_analysis()
+
+    assert hasattr(response, "status_code")
+    assert response.status_code == 204
+    assert backend_app.ACTIVE_COUNCIL_JOB_ID is None
+
+
+def test_council_active_endpoint_returns_204_when_missing_job(tmp_path, monkeypatch):
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+
+    job_id = "council-missing"
+    monkeypatch.setattr(backend_app, "JOBS_DIR", jobs_dir, raising=False)
+    monkeypatch.setattr(backend_app, "ACTIVE_COUNCIL_JOB_ID", job_id, raising=False)
+
+    client = TestClient(backend_app.app)
+    response = client.get("/api/council-analysis/active")
+
+    assert response.status_code == 204
+    assert backend_app.ACTIVE_COUNCIL_JOB_ID is None

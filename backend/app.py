@@ -2470,6 +2470,32 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
     }
 
 
+@app.get("/api/council-analysis/active")
+def get_active_council_analysis():
+    global ACTIVE_COUNCIL_JOB_ID
+    with COUNCIL_JOB_LOCK:
+        job_id = ACTIVE_COUNCIL_JOB_ID
+
+    if not job_id:
+        return Response(status_code=204)
+
+    job = _load_job(job_id)
+    if not job:
+        with COUNCIL_JOB_LOCK:
+            if ACTIVE_COUNCIL_JOB_ID == job_id:
+                ACTIVE_COUNCIL_JOB_ID = None
+        return Response(status_code=204)
+
+    return {
+        "job_id": job_id,
+        "status": job.get("status"),
+        "total": job.get("total"),
+        "done": job.get("done"),
+        "remaining": job.get("remaining"),
+        "interest_min": job.get("interest_min"),
+    }
+
+
 @app.get("/api/council-analysis/{job_id}")
 def get_council_analysis(job_id: str):
     job = _load_job(job_id)
@@ -2488,32 +2514,6 @@ def get_council_analysis(job_id: str):
     data = dict(job)
     data["message"] = " — ".join(part for part in msg_parts if part)
     return data
-
-
-@app.get("/api/council-analysis/active")
-def get_active_council_analysis():
-    global ACTIVE_COUNCIL_JOB_ID
-    with COUNCIL_JOB_LOCK:
-        job_id = ACTIVE_COUNCIL_JOB_ID
-
-    if not job_id:
-        return Response(status_code=204)
-
-    job = _load_job(job_id)
-    if not job:
-        with COUNCIL_JOB_LOCK:
-            if ACTIVE_COUNCIL_JOB_ID == job_id:
-                ACTIVE_COUNCIL_JOB_ID = None
-        raise HTTPException(status_code=404, detail="job-not-found")
-
-    return {
-        "job_id": job_id,
-        "status": job.get("status"),
-        "total": job.get("total"),
-        "done": job.get("done"),
-        "remaining": job.get("remaining"),
-        "interest_min": job.get("interest_min"),
-    }
 
 
 @app.post("/api/council-analysis/{job_id}/stop")
