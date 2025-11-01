@@ -37,6 +37,8 @@ const COUNCIL_STAGE_LABELS: Record<string, string> = {
 
 const ORACLE_STATUS_MAX_LENGTH = 'Oracle: Processing (last 2025-10-12T20:00:27+00:00 reddit:t3_1o4y3sa)'.length
 
+const ANALYSE_NEW_CANCEL_MESSAGE = 'User requested to cancel.'
+
 function truncateOracleStatus(text: string): string {
   if (text.length <= ORACLE_STATUS_MAX_LENGTH) {
     return text
@@ -252,6 +254,18 @@ export default function App() {
   const analyseNewStartInFlightRef = useRef(false)
   const [analyseNewRefreshComplete, setAnalyseNewRefreshComplete] = useState(false)
   const [analyseNewHadEligible, setAnalyseNewHadEligible] = useState(false)
+  const [analyseNewCancelRequested, setAnalyseNewCancelRequested] = useState(false)
+  const analyseNewCancelTargetsRef = useRef<{
+    refreshId: string | null
+    refreshRequested: boolean
+    councilId: string | null
+    councilRequested: boolean
+  }>({
+    refreshId: null,
+    refreshRequested: false,
+    councilId: null,
+    councilRequested: false,
+  })
 
   const syncAnalyseNewPending = useCallback(() => {
     setAnalyseNewPendingIds(Array.from(analyseNewPendingRef.current))
@@ -277,6 +291,13 @@ export default function App() {
     setAnalyseNewCouncilStarted(false)
     setAnalyseNewRefreshComplete(false)
     setAnalyseNewHadEligible(false)
+    setAnalyseNewCancelRequested(false)
+    analyseNewCancelTargetsRef.current = {
+      refreshId: null,
+      refreshRequested: false,
+      councilId: null,
+      councilRequested: false,
+    }
     setOracleIdleInfo(null)
     setOracleCursor(null)
     setOracleBanner((prev) =>
@@ -335,7 +356,8 @@ export default function App() {
   const progressDone = showOracleProgress ? oracleProgressDone : jobBatchDone
   const progressPct =
     progressTotal > 0 ? Math.round((Math.min(progressDone, progressTotal) / progressTotal) * 100) : 0
-  const progressMsg = (showOracleProgress ? oracleProgressMessage : baseBatchMsg) || ''
+  const baseProgressMsg = (showOracleProgress ? oracleProgressMessage : baseBatchMsg) || ''
+  const progressMsg = analyseNewCancelRequested ? ANALYSE_NEW_CANCEL_MESSAGE : baseProgressMsg
   const jobActive = refreshJob ? refreshJob.status === 'queued' || refreshJob.status === 'running' : Boolean(refreshJobId)
   const working = busy || jobBusy
   const councilTotal = councilProgress?.stages.length ?? 0
@@ -359,7 +381,7 @@ export default function App() {
   const councilJobActive = councilJob
     ? councilJob.status === 'queued' || councilJob.status === 'running' || councilJob.status === 'cancelling'
     : Boolean(councilJobId)
-  const interestSliderDisabled = councilJobActive || analyseNewActive
+  const interestSliderDisabled = councilJobActive || analyseNewActive || analyseNewCancelRequested
   const etaBaseSeconds =
     typeof councilJob?.current_eta_seconds === 'number' && councilJob.current_eta_seconds > 0
       ? councilJob.current_eta_seconds
@@ -383,9 +405,12 @@ export default function App() {
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
     .pop() || ''
-  const councilDisplayLog = (councilLogEntry || councilJobMessage || councilLastLine).trim()
-  const panelDisabled = busy || jobBusy || councilJobBusy || analyseNewActive
-  const oracleControlsDisabled = working || jobActive || councilJobActive || councilJobBusy || analyseNewActive
+  const councilDisplayLog = analyseNewCancelRequested
+    ? ANALYSE_NEW_CANCEL_MESSAGE
+    : (councilLogEntry || councilJobMessage || councilLastLine).trim()
+  const panelDisabled = busy || jobBusy || councilJobBusy || analyseNewActive || analyseNewCancelRequested
+  const oracleControlsDisabled =
+    working || jobActive || councilJobActive || councilJobBusy || analyseNewActive || analyseNewCancelRequested
   const oracleStatusIndicator = useMemo(() => {
     if (councilJobActive) {
       const stageInfo = extractLatestCouncilStage(councilLog)
@@ -637,10 +662,73 @@ export default function App() {
   }, [oracleBaseUrl])
 
   useEffect(() => {
+    if (!analyseNewCancelRequested) return undefined
+
+    const targets = analyseNewCancelTargetsRef.current
+    const stops: Promise<void>[] = []
+
+    if (!targets.refreshRequested) {
+      const refreshId = targets.refreshId ?? refreshJobId ?? null
+      if (refreshId) {
+        targets.refreshId = refreshId
+        targets.refreshRequested = true
+        stops.push(
+          (async () => {
+            try {
+              await stopRefreshJob(refreshId)
+            } catch (err: any) {
+              updateLog((prev) => `${prev ? `${prev}\n` : ''}Stop error: ${err?.message ?? err}`)
+            }
+          })(),
+        )
+      }
+    }
+
+    if (!targets.councilRequested) {
+      const councilId = targets.councilId ?? councilJobId ?? null
+      if (councilId) {
+        targets.councilId = councilId
+        targets.councilRequested = true
+        stops.push(
+          (async () => {
+            try {
+              await stopCouncilJob(councilId)
+            } catch (err: any) {
+              updateLog((prev) => `${prev ? `${prev}\n` : ''}Council stop error: ${err?.message ?? err}`)
+            }
+          })(),
+        )
+      }
+    }
+
+    if (stops.length > 0) {
+      void Promise.all(stops)
+    }
+
+    return undefined
+  }, [analyseNewCancelRequested, refreshJobId, councilJobId, updateLog])
+
+  useEffect(() => {
     if (!analyseNewActive) {
       setAnalyseNewCouncilStarted(false)
     }
   }, [analyseNewActive])
+
+  useEffect(() => {
+    if (!analyseNewCancelRequested) return undefined
+    if (jobBusy || councilJobBusy || refreshJobId || councilJobId) {
+      return undefined
+    }
+    resetAnalyseNewState()
+    return undefined
+  }, [
+    analyseNewCancelRequested,
+    jobBusy,
+    councilJobBusy,
+    refreshJobId,
+    councilJobId,
+    resetAnalyseNewState,
+  ])
 
   const appendLog = (entry: string) => {
     const trimmedEntry = entry.trim()
@@ -1434,6 +1522,13 @@ export default function App() {
 
   async function handleAnalyseNewToggle(next: boolean) {
     if (next) {
+      setAnalyseNewCancelRequested(false)
+      analyseNewCancelTargetsRef.current = {
+        refreshId: null,
+        refreshRequested: false,
+        councilId: null,
+        councilRequested: false,
+      }
       if (working || jobActive || councilJobActive || councilJobBusy) {
         updateLog((prev) => prev || 'Finish current jobs before analysing new articles.')
         resetAnalyseNewState()
@@ -1482,20 +1577,56 @@ export default function App() {
 
     const refreshId = refreshJobId
     const councilId = councilJobId
-    resetAnalyseNewState()
+    const hasRefreshProcess = jobBusy || jobActive || Boolean(refreshId)
+    const hasCouncilProcess = councilJobBusy || councilJobActive || Boolean(councilId)
+
+    if (!hasRefreshProcess && !hasCouncilProcess) {
+      resetAnalyseNewState()
+      return
+    }
+
+    setAnalyseNewCancelRequested(true)
+    analyseNewCancelTargetsRef.current = {
+      refreshId: refreshId ?? null,
+      refreshRequested: Boolean(refreshId),
+      councilId: councilId ?? null,
+      councilRequested: Boolean(councilId),
+    }
+    clearAnalyseNewQueues()
+    setAnalyseNewActive(false)
+    setAnalyseNewThreshold(null)
+    setAnalyseNewCouncilStarted(false)
+    setAnalyseNewRefreshComplete(false)
+    setAnalyseNewHadEligible(false)
+    const appendCancelMessage = (prev: string): string => {
+      if (!prev.trim()) return ANALYSE_NEW_CANCEL_MESSAGE
+      if (prev.includes(ANALYSE_NEW_CANCEL_MESSAGE)) return prev
+      return `${prev}\n${ANALYSE_NEW_CANCEL_MESSAGE}`
+    }
+    updateLog(appendCancelMessage)
+    setCouncilLog((prev) => appendCancelMessage(prev))
+    setCouncilLogEntry((prev) => (prev || ANALYSE_NEW_CANCEL_MESSAGE))
+    setRefreshJob((prev) => (prev ? { ...prev, message: ANALYSE_NEW_CANCEL_MESSAGE } : prev))
+    setCouncilJob((prev) => (prev ? { ...prev, message: ANALYSE_NEW_CANCEL_MESSAGE } : prev))
+
     if (refreshId) {
       try {
         await stopRefreshJob(refreshId)
       } catch (e: any) {
         updateLog((prev) => `${prev ? `${prev}\n` : ''}Stop error: ${e.message}`)
       }
+    } else {
+      analyseNewCancelTargetsRef.current.refreshRequested = false
     }
+
     if (councilId) {
       try {
         await stopCouncilJob(councilId)
       } catch (e: any) {
         updateLog((prev) => `${prev ? `${prev}\n` : ''}Council stop error: ${e.message}`)
       }
+    } else {
+      analyseNewCancelTargetsRef.current.councilRequested = false
     }
   }
 

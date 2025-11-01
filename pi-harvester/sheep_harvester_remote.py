@@ -20,9 +20,11 @@ Examples
   --interval 60 \
   --max-items 16 \
   --batch-size 8 \
-  --per-post-sleep 0.4 \
+  --per-post-sleep 1 \
   --remote-timeout 45
 
+
+per post sleep was 0.4 - but server is crashing.
 
 Troubleshooting:
 Check Oracle Server is active:  

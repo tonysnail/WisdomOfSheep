@@ -258,7 +258,7 @@ export async function getRefreshJob(jobId: string): Promise<RefreshJob> {
 
 export async function getActiveRefreshJob(): Promise<RefreshJob | null> {
   const res = await fetch(`${API}/api/refresh-summaries/active`)
-  if (res.status === 404 || res.status === 204) return null
+  if (res.status === 404) return null
   if (!res.ok) {
     const txt = await res.text()
     throw new Error(`HTTP ${res.status}: ${txt}`)

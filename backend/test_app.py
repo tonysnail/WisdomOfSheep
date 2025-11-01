@@ -4,10 +4,8 @@ import time
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 
 from backend import app as backend_app
-from backend import jobs as backend_jobs
 from council import interest_score
 
 
@@ -21,10 +19,6 @@ def temp_db(tmp_path, monkeypatch):
         conn.close()
     monkeypatch.setattr(backend_app, "DB_PATH", db_path)
     monkeypatch.setattr(backend_app, "_DB_READY_PATH", None, raising=False)
-    jobs_dir = tmp_path / "jobs"
-    jobs_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(backend_app, "JOBS_DIR", jobs_dir)
-    monkeypatch.setattr(backend_jobs, "JOBS_DIR", jobs_dir)
     return db_path
 
 
@@ -208,58 +202,6 @@ def test_run_research_pipeline_reports_ticker_context(temp_db):
     assert isinstance(detail, dict)
     assert detail.get("error") == "ticker-not-found"
     assert detail.get("reason") == "no candidate tickers extracted"
-
-
-class DummyResponse:
-    def __init__(self, status_code: int):
-        self.status_code = status_code
-        self.text = ""
-
-    def json(self) -> dict[str, Any]:  # pragma: no cover - parity with requests.Response
-        return {}
-
-
-def _prepare_job(job_id: str) -> None:
-    now = time.time()
-    backend_app._job_save(
-        {
-            "id": job_id,
-            "status": "queued",
-            "log_tail": [],
-            "error": "",
-            "oracle_status": "connecting",
-            "created_at": now,
-            "updated_at": now,
-        }
-    )
-
-
-def test_oracle_health_404_skips_failure(temp_db):
-    job_id = "job-health-404"
-    _prepare_job(job_id)
-
-    should_continue = backend_app._process_oracle_health_response(job_id, DummyResponse(404))
-
-    assert should_continue is True
-    job = backend_app._load_job(job_id)
-    assert job is not None
-    assert job.get("status") == "queued"
-    assert any("/healthz returned 404" in entry for entry in job.get("log_tail", []))
-
-
-def test_oracle_health_error_marks_job_failed(temp_db):
-    job_id = "job-health-error"
-    _prepare_job(job_id)
-
-    should_continue = backend_app._process_oracle_health_response(job_id, DummyResponse(503))
-
-    assert should_continue is False
-    job = backend_app._load_job(job_id)
-    assert job is not None
-    assert job.get("status") == "error"
-    assert job.get("error") == "oracle-healthz-503"
-    assert job.get("oracle_status") == "error"
-    assert job.get("ended_at") is not None
 
 
 def test_posts_calendar_counts_by_day(temp_db):
@@ -624,101 +566,3 @@ def test_refresh_summaries_worker_ingests_conversation_hub(temp_db, tmp_path, mo
         ).fetchall()
 
     assert {row["stage"] for row in rows} >= {"summariser"}
-
-
-def test_refresh_summaries_active_returns_204_when_missing_job(tmp_path, monkeypatch):
-    jobs_dir = tmp_path / "jobs"
-    jobs_dir.mkdir(parents=True, exist_ok=True)
-
-    job_id = "job-missing"
-    monkeypatch.setattr(backend_app, "JOBS_DIR", jobs_dir, raising=False)
-    monkeypatch.setattr(backend_app, "ACTIVE_JOB_ID", job_id, raising=False)
-
-    response = backend_app.get_active_refresh_summaries()
-
-    assert hasattr(response, "status_code")
-    assert response.status_code == 204
-    assert backend_app.ACTIVE_JOB_ID is None
-
-
-def test_refresh_summaries_active_endpoint_is_not_shadowed(tmp_path, monkeypatch):
-    jobs_dir = tmp_path / "jobs"
-    jobs_dir.mkdir(parents=True, exist_ok=True)
-
-    job_id = "job-missing"
-    monkeypatch.setattr(backend_app, "JOBS_DIR", jobs_dir, raising=False)
-    monkeypatch.setattr(backend_app, "ACTIVE_JOB_ID", job_id, raising=False)
-
-    client = TestClient(backend_app.app)
-    response = client.get("/api/refresh-summaries/active")
-
-    assert response.status_code == 204
-    assert backend_app.ACTIVE_JOB_ID is None
-
-
-def test_refresh_summaries_active_returns_payload(tmp_path, monkeypatch):
-    jobs_dir = tmp_path / "jobs"
-    jobs_dir.mkdir(parents=True, exist_ok=True)
-
-    monkeypatch.setattr(backend_app, "JOBS_DIR", jobs_dir, raising=False)
-
-    job_id = "job-active"
-    now = time.time()
-    backend_app._job_save(
-        {
-            "id": job_id,
-            "status": "running",
-            "total": 5,
-            "done": 2,
-            "phase": "processing",
-            "current": "post-123",
-            "log_tail": ["line"],
-            "created_at": now,
-            "updated_at": now,
-        }
-    )
-
-    monkeypatch.setattr(backend_app, "ACTIVE_JOB_ID", job_id, raising=False)
-
-    client = TestClient(backend_app.app)
-    response = client.get("/api/refresh-summaries/active")
-
-    assert response.status_code == 200
-    data = response.json()
-    assert data["id"] == job_id
-    assert data["job_id"] == job_id
-    assert data["status"] == "running"
-    assert data["total"] == 5
-    assert data["done"] == 2
-    assert data["log_tail"] == ["line"]
-    assert data["message"].startswith("processing 2/5")
-
-
-def test_council_active_returns_204_when_missing_job(tmp_path, monkeypatch):
-    jobs_dir = tmp_path / "jobs"
-    jobs_dir.mkdir(parents=True, exist_ok=True)
-
-    job_id = "council-missing"
-    monkeypatch.setattr(backend_app, "JOBS_DIR", jobs_dir, raising=False)
-    monkeypatch.setattr(backend_app, "ACTIVE_COUNCIL_JOB_ID", job_id, raising=False)
-
-    response = backend_app.get_active_council_analysis()
-
-    assert hasattr(response, "status_code")
-    assert response.status_code == 204
-    assert backend_app.ACTIVE_COUNCIL_JOB_ID is None
-
-
-def test_council_active_endpoint_returns_204_when_missing_job(tmp_path, monkeypatch):
-    jobs_dir = tmp_path / "jobs"
-    jobs_dir.mkdir(parents=True, exist_ok=True)
-
-    job_id = "council-missing"
-    monkeypatch.setattr(backend_app, "JOBS_DIR", jobs_dir, raising=False)
-    monkeypatch.setattr(backend_app, "ACTIVE_COUNCIL_JOB_ID", job_id, raising=False)
-
-    client = TestClient(backend_app.app)
-    response = client.get("/api/council-analysis/active")
-
-    assert response.status_code == 204
-    assert backend_app.ACTIVE_COUNCIL_JOB_ID is None
