@@ -5,44 +5,134 @@
 from __future__ import annotations
 
 import contextlib
+import csv
 import io
 import json
 import logging
 import os
-import sys
-import sqlite3
-import csv
-import math
-import re
 import random
-import shutil
+import re
+import sqlite3
 import threading
 import time
 import uuid
-
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Callable, Literal
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Literal
 
-from urllib.parse import urljoin
+from fastapi import Body, FastAPI, HTTPException, Query, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.middleware.cors import CORSMiddleware
+import requests
 
-
-ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+from backend import utils
+from backend.council_time import CouncilTimeModel, approximate_token_count
+from backend.config import (
+    BATCH_LIMIT,
+    CSV_PATH,
+    DB_PATH,
+    CONVO_STORE_PATH,
+    JOB_LOG_KEEP,
+    JOBS_DIR,
+    ORACLE_BACKOFF_MAX,
+    ORACLE_BACKOFF_MIN,
+    ORACLE_BATCH_SIZE,
+    ORACLE_BATCH_SLEEP,
+    ORACLE_DEFAULT_BASE_URL,
+    ORACLE_MAX_RETRIES,
+    ORACLE_POLL_BASE,
+    ORACLE_POLL_MAX,
+    ORACLE_REQUEST_TIMEOUT,
+    PAGE_SIZE_DEFAULT,
+    ROUND_TABLE_AUTOFILL,
+    ROUND_TABLE_DUMP_DIR,
+    ROUND_TABLE_EVIDENCE_LOOKBACK,
+    ROUND_TABLE_HOST,
+    ROUND_TABLE_MAX_EVIDENCE,
+    ROUND_TABLE_MODEL,
+    ROUND_TABLE_PRETTY,
+    ROUND_TABLE_TIMEOUT,
+    ROUND_TABLE_VERBOSE,
+    STDIO_TRIM,
+    TIME_MODEL_PATH,
+    ROOT,
+)
+from backend.conversation import (
+    extract_convo_tickers as _extract_convo_tickers,
+    fetch_recent_deltas as _fetch_recent_deltas,
+    filter_valid_tickers as _filter_valid_tickers,
+    get_conversation_hub as _get_conversation_hub,
+    ingest_conversation_hub as _ingest_conversation_hub,
+    load_ticker_universe as _load_ticker_universe,
+)
+from backend.database import (
+    connect as _connect,
+    ensure_database_ready as _ensure_database_ready,
+    ensure_schema as _ensure_schema,
+    execute as _exec,
+    insert_stage_payload as _insert_stage_payload,
+    latest_stage_payload as _latest_stage_payload,
+    load_extras_dict as _load_extras_dict,
+    query_all as _q_all,
+    query_one as _q_one,
+    save_extras_dict as _save_extras_dict,
+    strip_research_from_extras as _strip_research_from_extras,
+    upsert_extras as _upsert_extras,
+    upsert_post_row as _upsert_post_row,
+)
+from backend.interest import InterestRecord, build_interest_record as _build_interest_record
+from backend.jobs import (
+    job_append_log as _job_append_log,
+    job_increment as _job_increment,
+    job_path as _job_path,
+    job_update_fields as _job_update_fields,
+    load_job as _load_job,
+)
+from backend.oracle import (
+    ORACLE_CURSOR_PATH,
+    ORACLE_RETRY_STATE_PATH,
+    ORACLE_SKIPPED_PATH,
+    ORACLE_UNSUMMARISED_PATH,
+    append_skipped_article as _append_skipped_article,
+    auth_tuple as _oracle_auth_tuple,
+    clear_unsummarised as _clear_oracle_unsummarised,
+    default_cursor as _default_oracle_cursor,
+    default_retry_state as _default_oracle_retry_state,
+    join_url as _oracle_join,
+    load_cursor as _load_oracle_cursor,
+    load_retry_state as _load_oracle_retry_state,
+    save_cursor as _save_oracle_cursor,
+    save_retry_state as _save_oracle_retry_state,
+    save_unsummarised as _save_oracle_unsummarised,
+)
+from backend.research_tools import (
+    SENTIMENT_TOOLS,
+    TECH_TOOLS,
+    build_research_summary_text as _build_research_summary_text,
+    execute_technical_plan as _execute_technical_plan,
+    run_sentiment_block as _run_sentiment_block,
+    summarize_sentiment as _summarize_sentiment,
+    summarize_technical_results as _summarize_technical_results,
+)
+from backend.schemas import (
+    BatchRunFilter,
+    BatchRunRequest,
+    BatchRunResponse,
+    CalendarDay,
+    PostDetail,
+    PostListItem,
+    PostRow,
+    PostsCalendarResponse,
+    ResearchPayload,
+    ResearchResponse,
+    ResearchTickerPayload,
+    RunStageRequest,
+    RunStageResponse,
+)
 
 COUNCIL_FAILURES_PATH = ROOT / "council_failures.json"
 COUNCIL_FAILURES_LOCK = threading.Lock()
-
-from fastapi import Body, FastAPI, HTTPException, Query, Response
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from fastapi.encoders import jsonable_encoder
-
-import requests
-
-from backend.council_time import CouncilTimeModel, approximate_token_count
 
 
 # round_table.py pulls in heavy optional dependencies (pandas, etc.). During
@@ -62,14 +152,6 @@ except Exception as exc:  # noqa: BLE001
     get_stock_window = None  # type: ignore[assignment]
     STOCK_WINDOW_IMPORT_ERROR = exc
 
-try:  # pragma: no cover - optional dependency for conversation hub ingestion
-    from ticker_conversation_hub import ConversationHub, SQLiteStore, compute_ticker_signal
-    CONVO_HUB_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # noqa: BLE001
-    ConversationHub = None  # type: ignore[assignment]
-    SQLiteStore = None  # type: ignore[assignment]
-    CONVO_HUB_IMPORT_ERROR = exc
-
 try:  # pragma: no cover - optional interest score computation
     from council.interest_score import compute_interest_for_post
     INTEREST_SCORE_IMPORT_ERROR: Exception | None = None
@@ -78,194 +160,31 @@ except Exception as exc:  # noqa: BLE001
     INTEREST_SCORE_IMPORT_ERROR = exc
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_float(name: str, default: float | None) -> Optional[float]:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return default
-    return value
-
-
-def _env_flag(name: str, default: str = "0") -> bool:
-    return os.getenv(name, default).strip().lower() not in {"", "0", "false", "no"}
-
-
-# =========================
-# Config (env-overridable)
-# =========================
 LOGGER = logging.getLogger(__name__)
-DB_PATH = ROOT / "council" / "wisdom_of_sheep.sql"
-DB_TEMPLATE_PATH = ROOT / "council" / "wisdom_of_sheep-empty.sql"
-SCHEMA_PATH = ROOT / "council" / "council_schema.sql"
-TIME_MODEL_PATH = ROOT / "council" / "council_time_model.json"
-CSV_PATH = ROOT / "raw_posts_log.csv"
-TICKERS_DIR = ROOT / "tickers"  # <- your new folder
+
+_build_markets_from_entity = utils.build_markets_from_entity
+_build_signal_from_dir_or_mod = utils.build_signal_from_dir_or_mod
+_parse_spam_likelihood = utils.parse_spam_likelihood
+_parse_spam_reason = utils.parse_spam_reason
+_now_iso = utils.now_iso
+_normalize_article_time = utils.normalize_article_time
+_clean_strings = utils.clean_strings
+_extract_claim_texts = utils.extract_claim_texts
+_direction_estimate = utils.direction_estimate
+_primary_ticker = utils.primary_ticker
+_trim = utils.trim
 
 
-DATA_DIR = ROOT / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-ORACLE_CURSOR_PATH = DATA_DIR / "oracle_cursor.json"
-ORACLE_RETRY_STATE_PATH = DATA_DIR / "oracle_retry_state.json"
-ORACLE_SKIPPED_PATH = DATA_DIR / "skipped_articles.json"
-ORACLE_UNSUMMARISED_PATH = DATA_DIR / "oracle_unsummarised.json"
-ORACLE_DEFAULT_BASE_URL = (os.getenv("WOS_ORACLE_BASE_URL", "") or "").strip()
-ORACLE_USER = os.getenv("WOS_ORACLE_USER", "")
-ORACLE_PASS = os.getenv("WOS_ORACLE_PASS", "")
-ORACLE_BATCH_SIZE = max(1, _env_int("WOS_ORACLE_BATCH_SIZE", 32))
-_ORACLE_BATCH_SLEEP_RAW = _env_float("WOS_ORACLE_BATCH_SLEEP", 0.2)
-ORACLE_BATCH_SLEEP = 0.0 if _ORACLE_BATCH_SLEEP_RAW is None else max(0.0, _ORACLE_BATCH_SLEEP_RAW)
-_ORACLE_POLL_BASE_RAW = _env_float("WOS_ORACLE_POLL_BASE_SECONDS", 10.0)
-ORACLE_POLL_BASE = 10.0 if _ORACLE_POLL_BASE_RAW is None else max(1.0, _ORACLE_POLL_BASE_RAW)
-_ORACLE_POLL_MAX_RAW = _env_float("WOS_ORACLE_POLL_MAX_SECONDS", 60.0)
-ORACLE_POLL_MAX = 60.0 if _ORACLE_POLL_MAX_RAW is None else max(ORACLE_POLL_BASE, _ORACLE_POLL_MAX_RAW)
-_ORACLE_BACKOFF_MIN_RAW = _env_float("WOS_ORACLE_BACKOFF_MIN_SECONDS", 2.0)
-ORACLE_BACKOFF_MIN = 2.0 if _ORACLE_BACKOFF_MIN_RAW is None else max(0.5, _ORACLE_BACKOFF_MIN_RAW)
-_ORACLE_BACKOFF_MAX_RAW = _env_float("WOS_ORACLE_BACKOFF_MAX_SECONDS", 30.0)
-ORACLE_BACKOFF_MAX = 30.0 if _ORACLE_BACKOFF_MAX_RAW is None else max(ORACLE_BACKOFF_MIN, _ORACLE_BACKOFF_MAX_RAW)
-ORACLE_REQUEST_TIMEOUT = _env_float("WOS_ORACLE_TIMEOUT_SECONDS", 30.0)
-ORACLE_MAX_RETRIES = max(0, _env_int("WOS_ORACLE_MAX_RETRIES", 3))
-
-
-def _handle_wal_files(base_path: Path, dest_base: Path | None) -> None:
-    for suffix in ("-wal", "-shm"):
-        candidate = base_path.with_name(f"{base_path.name}{suffix}")
-        if not candidate.exists():
-            continue
-        try:
-            if dest_base is not None:
-                dest = dest_base.with_name(f"{dest_base.name}{suffix}")
-                shutil.move(str(candidate), str(dest))
-            else:
-                candidate.unlink()
-        except OSError:
-            continue
-
-
-def _read_schema() -> str:
-    if not SCHEMA_PATH.exists():
-        raise RuntimeError(f"Missing council schema at {SCHEMA_PATH}")
-    return SCHEMA_PATH.read_text(encoding="utf-8")
-
-
-def _initialize_db_file(target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    _handle_wal_files(target, None)
-    if target.exists():
-        target.unlink()
-
-    if target == DB_PATH and DB_TEMPLATE_PATH.exists():
-        shutil.copyfile(DB_TEMPLATE_PATH, target)
-    else:
-        schema_sql = _read_schema()
-        with sqlite3.connect(str(target)) as conn:
-            conn.executescript(schema_sql)
-            conn.commit()
-
-
-def _is_db_healthy(path: Path) -> bool:
-    try:
-        with sqlite3.connect(str(path)) as conn:
-            row = conn.execute("PRAGMA quick_check").fetchone()
-    except sqlite3.DatabaseError:
-        return False
-    if not row:
-        return False
-    return str(row[0]).strip().lower() == "ok"
-
-
-def _backup_corrupt_db(path: Path) -> Path | None:
-    if not path.exists():
+def _norm_optional_str(value: Any) -> Optional[str]:
+    if value is None:
         return None
-    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    backup = path.with_name(f"{path.stem}.corrupt-{timestamp}{path.suffix}")
-    shutil.move(str(path), str(backup))
-    _handle_wal_files(path, backup)
-    return backup
-
-
-_DB_READY_LOCK = threading.Lock()
-_DB_READY_PATH: Path | None = None
-
-
-def _ensure_database_ready() -> None:
-    global _DB_READY_PATH
-    current = Path(DB_PATH)
-    if _DB_READY_PATH is not None and _DB_READY_PATH == current:
-        return
-
-    with _DB_READY_LOCK:
-        if _DB_READY_PATH is not None and _DB_READY_PATH == current:
-            return
-
-        current.parent.mkdir(parents=True, exist_ok=True)
-        if not current.exists():
-            LOGGER.warning("council database missing at %s; creating new file", current)
-            _initialize_db_file(current)
-        elif not _is_db_healthy(current):
-            backup = _backup_corrupt_db(current)
-            if backup is not None:
-                LOGGER.error("council database at %s was corrupt; backed up to %s and reinitialised", current, backup)
-            else:
-                LOGGER.error("council database at %s was corrupt; reinitialising", current)
-            _initialize_db_file(current)
-
-        _DB_READY_PATH = current
-
-PAGE_SIZE_DEFAULT = _env_int("WOS_PAGE_SIZE", 50)
-BATCH_LIMIT = _env_int("WOS_BATCH_LIMIT", 200)
-STDIO_TRIM = _env_int("WOS_STDIO_TRIM", 100_000)  # 100KB
-
-ROUND_TABLE_MODEL = os.getenv("WOS_MODEL_NAME", "mistral")
-ROUND_TABLE_HOST = os.getenv("WOS_MODEL_HOST", "http://localhost:11434")
-ROUND_TABLE_TIMEOUT_RAW = _env_float("WOS_MODEL_TIMEOUT_SECS", None)
-ROUND_TABLE_TIMEOUT = (
-    None if ROUND_TABLE_TIMEOUT_RAW is None or ROUND_TABLE_TIMEOUT_RAW <= 0 else ROUND_TABLE_TIMEOUT_RAW
-)
-ROUND_TABLE_VERBOSE = _env_flag("WOS_RUNNER_VERBOSE", "1")
-ROUND_TABLE_AUTOFILL = _env_flag("WOS_RUNNER_AUTOFILL", "1")
-ROUND_TABLE_PRETTY = _env_flag("WOS_RUNNER_PRETTY", "0")
-ROUND_TABLE_DUMP_DIR = os.getenv("WOS_RUNNER_DUMP_DIR") or None
-ROUND_TABLE_EVIDENCE_LOOKBACK = _env_int("WOS_EVIDENCE_LOOKBACK_DAYS", 120)
-ROUND_TABLE_MAX_EVIDENCE = _env_int("WOS_MAX_EVIDENCE_PER_CLAIM", 3)
-
-CONVO_STORE_PATH = ROOT / "convos" / "conversations.sqlite"
-CONVO_MODEL = os.getenv("WOS_CONVO_MODEL", ROUND_TABLE_MODEL)
-
-CONVO_HUB_LOCK = threading.Lock()
-CONVO_HUB_INSTANCE: Optional["ConversationHub"] = None
-_TICKER_UNIVERSE: Optional[Set[str]] = None
+    try:
+        text = str(value).strip()
+    except Exception:  # noqa: BLE001
+        return None
+    return text or None
 
 COUNCIL_TIME_MODEL = CouncilTimeModel(TIME_MODEL_PATH)
-
-
-# ───────────────────────── Technical / Sentiment tool palettes ─────────────────────────
-# We’ll use these to (a) strip sentiment-only steps from the technical plan and
-# (b) avoid throwing “unknown_tool” inside the technical executor.
-TECH_TOOLS: Set[str] = {
-    "price_window",
-    "compute_indicators",
-    "trend_strength",
-    "volatility_state",
-    "support_resistance_check",
-    "bollinger_breakout_scan",
-    "obv_trend",
-    "mfi_flow",
-}
-SENTIMENT_TOOLS: Set[str] = {"news_hub_score", "news_hub_ask_as_of"}
 
 # ================
 # Job persistence
@@ -340,801 +259,6 @@ def _startup_init() -> None:
 # =========================
 # DB helpers
 # =========================
-def _connect() -> sqlite3.Connection:
-    _ensure_database_ready()
-    if not DB_PATH.exists():
-        raise RuntimeError(f"DB not found: {DB_PATH}")
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _q_all(conn: sqlite3.Connection, sql: str, params: Tuple[Any, ...]) -> List[sqlite3.Row]:
-    cur = conn.execute(sql, params)
-    return cur.fetchall()
-
-def _q_one(conn: sqlite3.Connection, sql: str, params: Tuple[Any, ...]) -> Optional[sqlite3.Row]:
-    cur = conn.execute(sql, params)
-    return cur.fetchone()
-
-def _exec(conn: sqlite3.Connection, sql: str, params: Tuple[Any, ...]) -> None:
-    conn.execute(sql, params)
-    conn.commit()
-
-
-def _norm_optional_str(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    try:
-        text = str(value).strip()
-    except Exception:  # noqa: BLE001
-        return None
-    return text or None
-
-def _upsert_post_row(conn: sqlite3.Connection, post_vals: Dict[str, Any]) -> None:
-    conn.execute("""
-        INSERT INTO posts (post_id, platform, source, url, title, author, scraped_at, posted_at, score, text)
-        VALUES (:post_id, :platform, :source, :url, :title, :author, :scraped_at, :posted_at, :score, :text)
-        ON CONFLICT(post_id) DO UPDATE SET
-            platform=excluded.platform,
-            source=excluded.source,
-            url=excluded.url,
-            title=excluded.title,
-            author=excluded.author,
-            scraped_at=excluded.scraped_at,
-            posted_at=excluded.posted_at,
-            score=excluded.score,
-            text=excluded.text
-    """, post_vals)
-    conn.commit()
-
-def _upsert_extras(conn: sqlite3.Connection, post_id: str, extras_vals: Dict[str, Any]) -> None:
-    payload_json = json.dumps(extras_vals, ensure_ascii=False)
-    conn.execute("""
-        INSERT INTO post_extras (post_id, payload_json)
-        VALUES (?, ?)
-        ON CONFLICT(post_id) DO UPDATE SET payload_json=excluded.payload_json
-    """, (post_id, payload_json))
-    conn.commit()
-
-def _ensure_schema(conn: sqlite3.Connection):
-    # posts: canonical article fields
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS posts (
-      post_id    TEXT PRIMARY KEY,
-      platform   TEXT,
-      source     TEXT,
-      url        TEXT,
-      title      TEXT,
-      author     TEXT,
-      scraped_at TEXT,
-      posted_at  TEXT,
-      score      INTEGER,
-      text       TEXT
-    )""")
-    # stages: immutable history of stage outputs
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS stages (
-      post_id    TEXT NOT NULL,
-      stage      TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-      payload    TEXT NOT NULL,
-      PRIMARY KEY (post_id, stage, created_at)
-    )""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_stages_post_stage_created ON stages(post_id, stage, created_at)")
-    # post_extras: aux JSON per post
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS post_extras (
-      post_id      TEXT PRIMARY KEY,
-      payload_json TEXT NOT NULL
-    )""")
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS council_analysis_errors (
-      id           INTEGER PRIMARY KEY AUTOINCREMENT,
-      post_id      TEXT NOT NULL,
-      stage        TEXT,
-      stage_label  TEXT,
-      message      TEXT,
-      log_excerpt  TEXT,
-      job_id       TEXT,
-      occurred_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-    )""")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_council_analysis_errors_post ON council_analysis_errors(post_id)"
-    )
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS council_stage_interest (
-      post_id             TEXT PRIMARY KEY,
-      ticker              TEXT,
-      status              TEXT NOT NULL DEFAULT 'ok',
-      interest_score      REAL,
-      interest_label      TEXT,
-      interest_why        TEXT,
-      council_recommended INTEGER,
-      council_priority    TEXT,
-      error_code          TEXT,
-      error_message       TEXT,
-      created_at          TEXT,
-      debug_json          TEXT
-    )""")
-    try:
-        cols = conn.execute("PRAGMA table_info(council_stage_interest)").fetchall()
-        existing_cols: Set[str] = set()
-        for row in cols:
-            try:
-                existing_cols.add(row["name"])
-            except Exception:  # noqa: BLE001
-                if isinstance(row, (tuple, list)) and len(row) > 1:
-                    existing_cols.add(str(row[1]))
-    except Exception:  # noqa: BLE001
-        existing_cols = set()
-    alters = [
-        (
-            "status",
-            "ALTER TABLE council_stage_interest ADD COLUMN status TEXT DEFAULT 'ok'",
-        ),
-        (
-            "interest_score",
-            "ALTER TABLE council_stage_interest ADD COLUMN interest_score REAL",
-        ),
-        (
-            "interest_label",
-            "ALTER TABLE council_stage_interest ADD COLUMN interest_label TEXT",
-        ),
-        (
-            "interest_why",
-            "ALTER TABLE council_stage_interest ADD COLUMN interest_why TEXT",
-        ),
-        (
-            "council_recommended",
-            "ALTER TABLE council_stage_interest ADD COLUMN council_recommended INTEGER",
-        ),
-        (
-            "council_priority",
-            "ALTER TABLE council_stage_interest ADD COLUMN council_priority TEXT",
-        ),
-        (
-            "error_code",
-            "ALTER TABLE council_stage_interest ADD COLUMN error_code TEXT",
-        ),
-        (
-            "error_message",
-            "ALTER TABLE council_stage_interest ADD COLUMN error_message TEXT",
-        ),
-        (
-            "created_at",
-            "ALTER TABLE council_stage_interest ADD COLUMN created_at TEXT",
-        ),
-        (
-            "debug_json",
-            "ALTER TABLE council_stage_interest ADD COLUMN debug_json TEXT",
-        ),
-    ]
-    for col_name, sql in alters:
-        if col_name in existing_cols:
-            continue
-        try:
-            conn.execute(sql)
-        except sqlite3.OperationalError:
-            continue
-    conn.commit()
-    
-# =========================
-# Schemas
-# =========================
-
-
-class InterestRecord(BaseModel):
-    status: str = "pending"
-    ticker: Optional[str] = None
-    interest_score: Optional[float] = None
-    interest_label: Optional[str] = None
-    interest_why: Optional[str] = None
-    council_recommended: Optional[bool] = None
-    council_priority: Optional[str] = None
-    calculated_at: Optional[str] = None
-    error_code: Optional[str] = None
-    error_message: Optional[str] = None
-    metrics: Dict[str, Any] = Field(default_factory=dict)
-
-
-class PostListItem(BaseModel):
-    post_id: str
-    title: str
-    platform: str
-    source: str
-    url: str
-    scraped_at: Optional[str] = None
-    posted_at: Optional[str] = None
-    preview: str
-    markets: List[str] = Field(default_factory=list)
-    signal: Dict[str, Any] = Field(default_factory=dict)
-    has_summary: bool = False
-    has_analysis: bool = False
-    summary_bullets: List[str] = Field(default_factory=list)
-    assets_mentioned: List[Dict[str, Optional[str]]] = Field(default_factory=list)
-    spam_likelihood_pct: int = 0
-    spam_why: str = ""
-    interest: Optional["InterestRecord"] = None
-    chairman_plain_english: Optional[str] = None
-    chairman_direction: Optional[str] = None
-
-
-class CalendarDay(BaseModel):
-    date: str
-    count: int
-    analysed_count: int = 0
-
-
-class PostsCalendarResponse(BaseModel):
-    days: List[CalendarDay] = Field(default_factory=list)
-
-
-class PostRow(BaseModel):
-    post_id: str
-    platform: Optional[str] = None
-    source: Optional[str] = None
-    url: Optional[str] = None
-    title: Optional[str] = None
-    author: Optional[str] = None
-    scraped_at: Optional[str] = None
-    posted_at: Optional[str] = None
-    score: Optional[int] = None
-    text: Optional[str] = None
-
-class PostDetail(BaseModel):
-    post: PostRow
-    extras: Dict[str, Any] = Field(default_factory=dict)
-    stages: Dict[str, Any] = Field(default_factory=dict)
-    interest: Optional[InterestRecord] = None
-
-class RunStageRequest(BaseModel):
-    post_id: str
-    stages: List[str]
-    overwrite: bool
-    refresh_from_csv: bool = False
-    echo_post: bool = False
-
-class RunStageResponse(BaseModel):
-    ok: bool
-    post_id: str
-    stages_run: List[str]
-    stdout: str = Field(default="")
-    stderr: str = Field(default="")
-
-
-def _parse_interest_debug(raw: Any) -> Dict[str, Any]:
-    if raw is None:
-        return {}
-    if isinstance(raw, (bytes, bytearray)):
-        raw = raw.decode("utf-8", errors="ignore")
-    if isinstance(raw, str):
-        text = raw.strip()
-        if not text:
-            return {}
-        try:
-            data = json.loads(text)
-        except Exception:  # noqa: BLE001
-            return {}
-        return data if isinstance(data, dict) else {}
-    if isinstance(raw, dict):
-        return raw
-    return {}
-
-
-def _build_interest_record(
-    *,
-    status: Any,
-    ticker: Any,
-    score: Any,
-    label: Any,
-    why: Any,
-    recommended: Any,
-    priority: Any,
-    calculated_at: Any,
-    error_code: Any,
-    error_message: Any,
-    debug_json: Any,
-) -> Optional[InterestRecord]:
-    status_raw = _norm_optional_str(status)
-    score_val: Optional[float]
-    try:
-        score_val = float(score) if score is not None else None
-    except Exception:  # noqa: BLE001
-        score_val = None
-
-    ticker_str = _norm_optional_str(ticker)
-    label_str = _norm_optional_str(label)
-    why_str = _norm_optional_str(why)
-    priority_str = _norm_optional_str(priority)
-    created_str = _norm_optional_str(calculated_at)
-    error_code_str = _norm_optional_str(error_code)
-    error_message_str = _norm_optional_str(error_message)
-
-    recommended_bool: Optional[bool]
-    if recommended is None:
-        recommended_bool = None
-    else:
-        raw = str(recommended).strip()
-        if raw == "" or raw.lower() == "none":
-            recommended_bool = None
-        else:
-            try:
-                recommended_bool = bool(int(float(raw)))
-            except Exception:  # noqa: BLE001
-                recommended_bool = bool(recommended)
-
-    if (
-        status_raw is None
-        and score_val is None
-        and error_code_str is None
-        and error_message_str is None
-    ):
-        return None
-
-    debug_dict = _parse_interest_debug(debug_json)
-    metrics: Dict[str, Any] = {}
-    if isinstance(debug_dict, dict):
-        metrics_payload = debug_dict.get("metrics")
-        if isinstance(metrics_payload, dict):
-            metrics = dict(metrics_payload)
-        else:
-            metrics = {}
-        for key in ("spam_pct", "platform", "source", "posted_at"):
-            if key in debug_dict and key not in metrics:
-                metrics[key] = debug_dict[key]
-
-    status_clean = status_raw or ("ok" if score_val is not None else "pending")
-
-    return InterestRecord(
-        status=status_clean,
-        ticker=ticker_str,
-        interest_score=score_val,
-        interest_label=label_str,
-        interest_why=why_str,
-        council_recommended=recommended_bool,
-        council_priority=priority_str,
-        calculated_at=created_str,
-        error_code=error_code_str,
-        error_message=error_message_str,
-        metrics=metrics,
-    )
-
-
-class ResearchTickerPayload(BaseModel):
-    ticker: str
-    article_time: str
-    hypotheses: List[Dict[str, Any]] = Field(default_factory=list)
-    rationale: str = ""
-    plan: Dict[str, Any] = Field(default_factory=dict)
-    technical: Dict[str, Any] = Field(default_factory=dict)
-    sentiment: Dict[str, Any] = Field(default_factory=dict)
-    summary_text: str = ""
-    updated_at: str
-    session_id: Optional[str] = None
-    log: str = ""
-
-
-class ResearchPayload(BaseModel):
-    article_time: str
-    updated_at: str
-    ordered_tickers: List[str] = Field(default_factory=list)
-    tickers: Dict[str, ResearchTickerPayload] = Field(default_factory=dict)
-
-
-class ResearchResponse(BaseModel):
-    ok: bool
-    research: ResearchPayload
-
-
-@app.get("/api/stocks/window")
-def api_get_stock_window(
-    ticker: str = Query(..., description="Ticker symbol to fetch, e.g., AAPL"),
-    center: Optional[str] = Query(None, description="Center timestamp (ISO8601)"),
-    before: Optional[str] = Query(None, description="Span before the center, e.g., 3d, 6h"),
-    after: Optional[str] = Query(None, description="Span after the center, e.g., 3d, 6h"),
-    interval: Optional[str] = Query(None, description="Explicit Yahoo Finance interval, e.g., 1m, 1d"),
-):
-    if not ticker:
-        raise HTTPException(status_code=400, detail="Ticker is required")
-
-    if not callable(get_stock_window):
-        hint = f": {STOCK_WINDOW_IMPORT_ERROR}" if STOCK_WINDOW_IMPORT_ERROR else ""
-        raise HTTPException(status_code=503, detail=f"stock-window-unavailable{hint}")
-
-    try:
-        window = get_stock_window(
-            ticker=ticker,
-            center=center,
-            before=before,
-            after=after,
-            interval=interval,
-            include_data=True,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:  # pragma: no cover - pass through unexpected errors
-        raise HTTPException(status_code=502, detail=f"Failed to fetch stock window: {exc}") from exc
-
-    return jsonable_encoder(asdict(window))
-
-class BatchRunFilter(BaseModel):
-    query: Optional[str] = None
-    platform: Optional[str] = None
-    source: Optional[str] = None
-    date_from: Optional[str] = None
-    date_to: Optional[str] = None
-
-class BatchRunRequest(BaseModel):
-    stages: List[str]
-    overwrite: bool
-    post_ids: Optional[List[str]] = None
-    filter: Optional[BatchRunFilter] = None
-    refresh_from_csv: bool = False
-
-class BatchRunResponse(BaseModel):
-    ok: bool
-    submitted: int
-    results: List[RunStageResponse]
-
-# =========================
-# Utilities
-# =========================
-def _build_markets_from_entity(payload: Any) -> List[str]:
-    if not payload:
-        return []
-    try:
-        assets = payload.get("assets") or []
-        vals = []
-        for a in assets:
-            t = (a.get("ticker") or "").strip()
-            if t:
-                vals.append(t)
-        # de-dup preserving order
-        seen = set()
-        uniq = []
-        for x in vals:
-            if x not in seen:
-                seen.add(x)
-                uniq.append(x)
-        return uniq[:8]  # short list for badges
-    except Exception:
-        return []
-
-def _build_signal_from_dir_or_mod(payload: Any) -> Dict[str, Any]:
-    if not payload:
-        return {}
-    out = {}
-    # common fields we’ve used historically
-    for k in ("bias", "direction", "stance", "verdict", "confidence"):
-        if k in payload:
-            out[k] = payload[k]
-    # normalize a tiny view
-    if "bias" not in out and "direction" in out:
-        out["bias"] = out["direction"]
-    return out
-
-
-_SPAM_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
-_CASHTAG_RE = re.compile(r"\$[A-Z]{1,5}\b")
-
-
-def _parse_spam_likelihood(value: Any) -> int:
-    """Return a clamped 0-100 integer spam likelihood from arbitrary inputs."""
-
-    if isinstance(value, (int, float)):
-        if isinstance(value, float) and not math.isfinite(value):
-            return 0
-        pct = int(float(value))
-    elif isinstance(value, str):
-        match = _SPAM_NUMBER_RE.search(value)
-        if not match:
-            return 0
-        try:
-            pct = int(float(match.group(0)))
-        except (TypeError, ValueError):
-            return 0
-    else:
-        return 0
-
-    return max(0, min(100, pct))
-
-
-def _parse_spam_reason(value: Any) -> str:
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, list):
-        parts: List[str] = []
-        for item in value:
-            if item is None:
-                continue
-            text = str(item).strip()
-            if text:
-                parts.append(text)
-        return "; ".join(parts)
-    return ""
-
-
-def _get_conversation_hub() -> Optional["ConversationHub"]:
-    if not callable(ConversationHub) or SQLiteStore is None:
-        return None
-    global CONVO_HUB_INSTANCE
-    with CONVO_HUB_LOCK:
-        if CONVO_HUB_INSTANCE is None:
-            try:
-                store = SQLiteStore(str(CONVO_STORE_PATH))
-                CONVO_HUB_INSTANCE = ConversationHub(store=store, model=CONVO_MODEL)
-            except Exception as exc:  # noqa: BLE001
-                logging.exception("conversation hub init failed: %s", exc)
-                CONVO_HUB_INSTANCE = None
-        return CONVO_HUB_INSTANCE
-
-
-def _load_ticker_universe() -> Set[str]:
-    global _TICKER_UNIVERSE
-    if _TICKER_UNIVERSE is not None:
-        return _TICKER_UNIVERSE
-
-    tickers_path = TICKERS_DIR / "tickers_enriched.csv"
-    universe: Set[str] = set()
-    if tickers_path.exists():
-        try:
-            with tickers_path.open("r", encoding="utf-8", newline="") as fh:
-                reader = csv.reader(fh)
-                header = next(reader, [])
-                ticker_idx = 0
-                for idx, name in enumerate(header):
-                    label = (name or "").strip().lower()
-                    if label in {"ticker", "symbol", "ticker_symbol"}:
-                        ticker_idx = idx
-                        break
-                for row in reader:
-                    if not row:
-                        continue
-                    try:
-                        raw_symbol = row[ticker_idx]
-                    except IndexError:
-                        continue
-                    symbol = (raw_symbol or "").strip().upper()
-                    if symbol:
-                        universe.add(symbol)
-        except Exception as exc:  # noqa: BLE001
-            logging.warning("Failed to load ticker universe from %s: %s", tickers_path, exc)
-
-    _TICKER_UNIVERSE = universe
-    return universe
-
-
-def _filter_valid_tickers(candidates: Sequence[str]) -> List[str]:
-    universe = _load_ticker_universe()
-    seen: Set[str] = set()
-    filtered: List[str] = []
-    for raw in candidates:
-        symbol = (raw or "").strip().upper()
-        if not symbol or symbol in seen:
-            continue
-        if universe and symbol not in universe:
-            continue
-        seen.add(symbol)
-        filtered.append(symbol)
-    return filtered
-
-
-def _fetch_recent_deltas(store: Any, ticker: str, as_of_iso: str, limit: int = 5) -> List[Dict[str, Any]]:
-    try:
-        records = store.records_before(ticker, as_of_iso, limit=4000)
-    except Exception:  # noqa: BLE001
-        return []
-
-    norm = (ticker or "").strip().upper()
-    deltas: List[Dict[str, Any]] = []
-    for rec in records:
-        if not isinstance(rec, dict) or rec.get("type") != "delta":
-            continue
-        data = rec.get("data") or {}
-        who = data.get("who") or []
-        if norm not in {str(w).strip().upper() for w in who if isinstance(w, str)}:
-            continue
-        entry = {
-            "t": data.get("t"),
-            "sum": data.get("sum"),
-            "dir": data.get("dir"),
-            "impact": data.get("impact"),
-            "why": data.get("why"),
-            "chan": data.get("chan"),
-            "cat": data.get("cat"),
-            "src": data.get("src"),
-            "url": data.get("url"),
-        }
-        deltas.append(entry)
-
-    deltas.sort(key=lambda item: (item.get("t") or ""))
-    return deltas[-limit:]
-
-
-def _extract_convo_tickers(post_row: sqlite3.Row, summariser: Dict[str, Any]) -> List[str]:
-    seen: set[str] = set()
-    ordered: List[str] = []
-
-    def _add(raw: Any) -> None:
-        if not raw:
-            return
-        value = str(raw).strip().upper()
-        if not value:
-            return
-        if value not in seen:
-            seen.add(value)
-            ordered.append(value)
-
-    primary = summariser.get("primary_ticker") or summariser.get("primaryTicker")
-    if isinstance(primary, str):
-        _add(primary)
-
-    assets = summariser.get("assets_mentioned") or summariser.get("assets") or []
-    if isinstance(assets, list):
-        for asset in assets:
-            if isinstance(asset, dict):
-                _add(asset.get("ticker"))
-
-    if isinstance(post_row, dict):
-        title = str(post_row.get("title") or "")
-        body = str(post_row.get("text") or "")
-    else:
-        title = str(post_row["title"] or "")
-        body = str(post_row["text"] or "")
-
-    text_blobs = [title, body]
-    for blob in text_blobs:
-        if not blob:
-            continue
-        for match in _CASHTAG_RE.findall(blob.upper()):
-            _add(match[1:])
-
-    return ordered[:6]
-
-
-def _ingest_conversation_hub(conn: sqlite3.Connection, post_id: str) -> Optional[Dict[str, Any]]:
-    hub = _get_conversation_hub()
-    if not hub:
-        return None
-
-    post_row = _q_one(
-        conn,
-        "SELECT post_id, platform, source, url, title, text, scraped_at, posted_at FROM posts WHERE post_id = ?",
-        (post_id,),
-    )
-    if not post_row:
-        return None
-
-    summariser = _latest_stage_payload(conn, post_id, "summariser")
-    if not summariser:
-        return None
-
-    tickers = _extract_convo_tickers(post_row, summariser)
-    if not tickers:
-        return None
-
-    bullets = _clean_strings(summariser.get("summary_bullets"))
-    if not bullets:
-        fallback = summariser.get("summary") or summariser.get("summary_text")
-        if isinstance(fallback, str) and fallback.strip():
-            bullets = [fallback.strip()]
-
-    extras = _load_extras_dict(conn, post_id)
-    ts = (
-        post_row["posted_at"]
-        or post_row["scraped_at"]
-        or extras.get("posted_at")
-        or extras.get("scraped_at")
-        or _now_iso()
-    )
-    url = extras.get("final_url") or post_row["url"] or ""
-    source = post_row["source"] or post_row["platform"] or extras.get("source") or "news"
-
-    try:
-        result = hub.ingest_article(
-            tickers=tickers,
-            title=post_row["title"] or "",
-            bullets=bullets,
-            url=url,
-            ts=ts,
-            source=source,
-            verbose=False,
-            post_id=post_id,
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"conversation-hub-ingest-failed: {exc}") from exc
-
-    delta = result.get("delta") or {}
-    payload = {
-        "post_id": post_id,
-        "tickers": result.get("tickers") or tickers,
-        "appended": result.get("appended", 0),
-        "skipped_old": result.get("skipped_old", 0),
-        "reason": result.get("reason"),
-        "delta": delta,
-        "ts": delta.get("t") or ts,
-        "source": source,
-        "url": url,
-        "ingested_at": _now_iso(),
-    }
-
-    _insert_stage_payload(conn, post_id, "conversation_hub", payload)
-    extras["conversation_hub"] = payload
-    _save_extras_dict(conn, post_id, extras)
-    return payload
-
-
-def _latest_stage_payload(conn: sqlite3.Connection, post_id: str, stage: str) -> Optional[Dict[str, Any]]:
-    row = _q_one(conn, """
-        SELECT payload FROM stages
-        WHERE post_id = ? AND stage = ?
-        ORDER BY datetime(created_at) DESC
-        LIMIT 1
-    """, (post_id, stage))
-    if not row or not row["payload"]:
-        return None
-    try:
-        return json.loads(row["payload"])
-    except Exception:
-        return None
-
-
-def _load_extras_dict(conn: sqlite3.Connection, post_id: str) -> Dict[str, Any]:
-    row = _q_one(conn, "SELECT payload_json FROM post_extras WHERE post_id = ?", (post_id,))
-    if not row or not row["payload_json"]:
-        return {}
-    try:
-        data = json.loads(row["payload_json"])
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    return {}
-
-
-def _save_extras_dict(conn: sqlite3.Connection, post_id: str, extras: Dict[str, Any]) -> None:
-    _upsert_extras(conn, post_id, extras)
-
-
-def _strip_research_from_extras(conn: sqlite3.Connection, post_id: Optional[str] = None) -> int:
-    """Remove cached research payloads from ``post_extras``.
-
-    Returns the number of posts whose extras were updated.
-    """
-
-    if post_id is not None:
-        targets = [post_id]
-    else:
-        rows = conn.execute("SELECT post_id FROM post_extras").fetchall()
-        targets = [row["post_id"] for row in rows if row and row["post_id"]]
-
-    updated = 0
-    for pid in targets:
-        extras = _load_extras_dict(conn, pid)
-        if "research" not in extras:
-            continue
-        extras.pop("research", None)
-        _save_extras_dict(conn, pid, extras)
-        updated += 1
-    return updated
-
-
-def _insert_stage_payload(
-    conn: sqlite3.Connection,
-    post_id: str,
-    stage: str,
-    payload: Dict[str, Any],
-) -> str:
-    created_at = _now_iso()
-    conn.execute(
-        "INSERT INTO stages (post_id, stage, created_at, payload) VALUES (?, ?, ?, ?)",
-        (post_id, stage, created_at, json.dumps(payload, ensure_ascii=False)),
-    )
-    conn.commit()
-    return created_at
-
-
 def _extract_summary_text(payload: Optional[Dict[str, Any]]) -> str:
     if not isinstance(payload, dict):
         return ""
@@ -1238,565 +362,6 @@ def _format_council_error_detail(detail: Any) -> str:
         except Exception:  # noqa: BLE001
             return str(detail)
     return str(detail)
-
-
-def _now_iso() -> str:
-    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _normalize_article_time(raw: Optional[str]) -> str:
-    if not raw:
-        return _now_iso()
-    try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        else:
-            dt = dt.astimezone(timezone.utc)
-        return dt.isoformat().replace("+00:00", "Z")
-    except Exception:
-        return raw
-
-
-def _clean_strings(value: Any) -> List[str]:
-    items: List[str] = []
-    if isinstance(value, list):
-        for item in value:
-            if item is None:
-                continue
-            text = str(item).strip()
-            if text:
-                items.append(text)
-    elif isinstance(value, str):
-        for part in value.splitlines():
-            text = part.strip()
-            if text:
-                items.append(text)
-    return items
-
-
-def _extract_claim_texts(payload: Dict[str, Any]) -> List[str]:
-    claims = payload.get("claims")
-    texts: List[str] = []
-    if isinstance(claims, list):
-        for claim in claims:
-            if isinstance(claim, dict):
-                text = claim.get("text")
-                if text is None:
-                    continue
-                clean = str(text).strip()
-                if clean:
-                    texts.append(clean)
-    return texts
-
-
-def _direction_estimate(direction_payload: Optional[Dict[str, Any]], summariser_payload: Optional[Dict[str, Any]]) -> str:
-    if isinstance(direction_payload, dict):
-        raw = direction_payload.get("implied_direction")
-        if isinstance(raw, str) and raw.strip():
-            return raw.strip()
-    if isinstance(summariser_payload, dict):
-        stance = summariser_payload.get("author_stance")
-        if isinstance(stance, str) and stance.strip():
-            s = stance.strip().lower()
-            mapping = {
-                "bullish": "up",
-                "bearish": "down",
-                "neutral": "neutral",
-                "uncertain": "uncertain",
-                "up": "up",
-                "down": "down",
-            }
-            return mapping.get(s, stance.strip())
-    return "uncertain"
-
-
-def _primary_ticker(
-    summariser_payload: Optional[Dict[str, Any]],
-    entity_payload: Optional[Dict[str, Any]],
-) -> Optional[str]:
-    candidates: List[str] = []
-    if isinstance(summariser_payload, dict):
-        assets = summariser_payload.get("assets_mentioned") or []
-        if isinstance(assets, list):
-            for asset in assets:
-                if isinstance(asset, dict):
-                    ticker = asset.get("ticker")
-                    if isinstance(ticker, str) and ticker.strip():
-                        candidates.append(ticker.strip().upper())
-    if not candidates and isinstance(entity_payload, dict):
-        assets = entity_payload.get("assets") or []
-        if isinstance(assets, list):
-            for asset in assets:
-                if isinstance(asset, dict):
-                    ticker = asset.get("ticker")
-                    if isinstance(ticker, str) and ticker.strip():
-                        candidates.append(ticker.strip().upper())
-    return candidates[0] if candidates else None
-
-
-def _try_float(value: Any) -> Optional[float]:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _format_tool_label(tool: str) -> str:
-    return tool.replace("_", " ").replace("-", " ").title()
-
-
-def _format_tool_result(tool: str, result: Dict[str, Any]) -> str:
-    if not isinstance(result, dict):
-        return f"{_format_tool_label(tool)}: no data"
-
-    if tool == "price_window":
-        rows = result.get("data")
-        if isinstance(rows, list) and rows:
-            first = rows[0]
-            last = rows[-1]
-            first_close = _try_float(first.get("Close"))
-            last_close = _try_float(last.get("Close"))
-            if first_close is not None and last_close is not None:
-                change = last_close - first_close
-                pct = (change / first_close * 100.0) if first_close else None
-                pct_str = f" ({pct:+.1f}%)" if pct is not None else ""
-                return f"Price window close {last_close:.2f}{pct_str}".strip()
-        note = result.get("note") or "no data"
-        return f"Price window: {note}"
-
-    if tool == "compute_indicators":
-        rsi = _try_float(result.get("rsi14"))
-        macd = result.get("macd") if isinstance(result.get("macd"), dict) else {}
-        hist = _try_float(macd.get("hist")) if isinstance(macd, dict) else None
-        close = _try_float(result.get("close"))
-        parts = []
-        if rsi is not None:
-            parts.append(f"RSI14 {rsi:.1f}")
-        if hist is not None:
-            parts.append(f"MACD hist {hist:+.2f}")
-        if close is not None:
-            parts.append(f"Close {close:.2f}")
-        if not parts:
-            note = result.get("note") or "no indicators"
-            parts.append(str(note))
-        return "; ".join(parts)
-
-    if tool == "trend_strength":
-        direction = result.get("direction")
-        strength = result.get("strength")
-        slope = _try_float(result.get("slope_pct_per_day"))
-        r2 = _try_float(result.get("r2"))
-        parts = []
-        if direction:
-            parts.append(f"Trend {direction}")
-        if strength is not None:
-            parts.append(f"Strength {strength}")
-        if slope is not None:
-            parts.append(f"Slope {slope:+.2f}%/day")
-        if r2 is not None:
-            parts.append(f"R² {r2:.2f}")
-        return "; ".join(parts) or "Trend strength: no data"
-
-    if tool == "volatility_state":
-        state = result.get("state")
-        ratio = _try_float(result.get("ratio"))
-        rv = _try_float(result.get("realized_vol_annual_pct"))
-        if state or ratio is not None or rv is not None:
-            parts = []
-            if state:
-                parts.append(f"Vol {state}")
-            if ratio is not None:
-                parts.append(f"Ratio {ratio:.2f}")
-            if rv is not None:
-                parts.append(f"RV {rv:.2f}%")
-            return "; ".join(parts)
-        note = result.get("note") or "volatility unavailable"
-        return str(note)
-
-    if tool == "support_resistance_check":
-        sup = _try_float(result.get("nearest_support"))
-        res = _try_float(result.get("nearest_resistance"))
-        pct_sup = _try_float(result.get("distance_to_support_pct"))
-        pct_res = _try_float(result.get("distance_to_resistance_pct"))
-        parts = []
-        if sup is not None:
-            if pct_sup is not None:
-                parts.append(f"Support {sup:.2f} ({pct_sup:+.1f}%)")
-            else:
-                parts.append(f"Support {sup:.2f}")
-        if res is not None:
-            if pct_res is not None:
-                parts.append(f"Resistance {res:.2f} ({pct_res:+.1f}%)")
-            else:
-                parts.append(f"Resistance {res:.2f}")
-        if parts:
-            return "; ".join(parts)
-        note = result.get("note") or "no levels"
-        return str(note)
-
-    if tool == "bollinger_breakout_scan":
-        event = result.get("last_event")
-        date = result.get("last_event_date")
-        pct_b = _try_float(result.get("%b"))
-        bw = _try_float(result.get("bandwidth"))
-        parts = []
-        if event:
-            parts.append(f"Last {event.replace('_', ' ')}")
-        if date:
-            parts.append(f"on {date}")
-        if pct_b is not None:
-            parts.append(f"%B {pct_b:.2f}")
-        if bw is not None:
-            parts.append(f"Bandwidth {bw:.3f}")
-        return " ".join(parts).strip() or "Bollinger scan: no signal"
-
-    if tool == "obv_trend":
-        trend = result.get("trend")
-        slope = _try_float(result.get("slope"))
-        r2 = _try_float(result.get("r2"))
-        parts = []
-        if trend:
-            parts.append(f"OBV {trend}")
-        if slope is not None:
-            parts.append(f"Slope {slope:+.0f}")
-        if r2 is not None:
-            parts.append(f"R² {r2:.2f}")
-        return "; ".join(parts) or "OBV trend: no data"
-
-    if tool == "mfi_flow":
-        mfi = _try_float(result.get("mfi"))
-        state = result.get("state")
-        parts = []
-        if mfi is not None:
-            parts.append(f"MFI {mfi:.0f}")
-        if state:
-            parts.append(state)
-        return " ".join(parts).strip() or "MFI flow: no data"
-
-    note = result.get("note")
-    return f"{_format_tool_label(tool)}: {note or 'no data'}"
-
-
-def _summarize_technical_results(results: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[str]]:
-    insights: List[Dict[str, Any]] = []
-    lines: List[str] = []
-    for record in results:
-        tool = record.get("tool") or "unknown"
-        status = record.get("status") or ("ok" if record.get("result") is not None else "error")
-        if status != "ok":
-            text = f"{_format_tool_label(tool)}: {record.get('error', 'failed')}"
-        else:
-            text = _format_tool_result(tool, record.get("result") or {})
-        insights.append({"tool": tool, "text": text, "status": status})
-        lines.append(text)
-    return insights, lines
-
-
-def _summarize_sentiment(data: Dict[str, Any]) -> str:
-    if "error" in data:
-        return f"Sentiment unavailable: {data['error']}"
-    ticker = data.get("ticker")
-    lookback = data.get("lookback_days")
-    ticker_series = data.get("series_ticker")
-    sector_series = data.get("series_sector")
-    parts: List[str] = []
-    if isinstance(ticker_series, list) and ticker_series:
-        last = ticker_series[-1]
-        avg = _try_float(last.get("avg_combined"))
-        posts = last.get("posts")
-        if avg is not None:
-            part = f"Ticker avg {avg:+.2f}"
-            if posts is not None:
-                part += f" across {posts} post(s)"
-            parts.append(part)
-    if isinstance(sector_series, list) and sector_series:
-        last = sector_series[-1]
-        avg = _try_float(last.get("avg_combined"))
-        posts = last.get("posts")
-        if avg is not None:
-            part = f"Sector avg {avg:+.2f}"
-            if posts is not None:
-                part += f" across {posts} post(s)"
-            parts.append(part)
-    counts = data.get("counts")
-    if isinstance(counts, dict):
-        considered = counts.get("considered")
-        if considered:
-            parts.append(f"Considered {considered} post(s)")
-    prefix = f"{ticker} sentiment ({lookback}d)" if ticker else "Sentiment"
-    return f"{prefix}: " + ("; ".join(parts) if parts else "no signal")
-
-
-def _build_research_summary_text(
-    ticker: str,
-    article_time: str,
-    hypotheses: List[Dict[str, Any]],
-    rationale: str,
-    technical_lines: List[str],
-    sentiment_summary: Optional[str],
-) -> str:
-    lines: List[str] = [f"Research focus: {ticker}", f"Article time: {article_time}"]
-    if hypotheses:
-        lines.append("")
-        lines.append("Hypotheses:")
-        for idx, hyp in enumerate(hypotheses, start=1):
-            if not isinstance(hyp, dict):
-                continue
-            text = str(hyp.get("text") or "").strip()
-            hyp_type = str(hyp.get("type") or "").strip()
-            if text:
-                if hyp_type:
-                    lines.append(f"{idx}. ({hyp_type}) {text}")
-                else:
-                    lines.append(f"{idx}. {text}")
-    if rationale:
-        lines.append("")
-        lines.append(f"Rationale: {rationale}")
-    if technical_lines:
-        lines.append("")
-        lines.append("Technical checks:")
-        for entry in technical_lines:
-            lines.append(f"- {entry}")
-    if sentiment_summary:
-        lines.append("")
-        lines.append(sentiment_summary)
-    return "\n".join(lines).strip()
-
-
-def _execute_technical_plan(plan: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
-    from technical_analyser import (
-        tool_bollinger_breakout_scan,
-        tool_compute_indicators,
-        tool_mfi_flow,
-        tool_obv_trend,
-        tool_price_window,
-        tool_support_resistance_check,
-        tool_trend_strength,
-        tool_volatility_state,
-    )
-
-    steps = plan.get("steps") if isinstance(plan, dict) else None
-    if not isinstance(steps, list):
-        steps = []
-
-    results: List[Dict[str, Any]] = []
-    for idx, raw_step in enumerate(steps):
-        record: Dict[str, Any] = {
-            "index": idx,
-            "tool": None,
-            "status": "skipped",
-        }
-        if not isinstance(raw_step, dict):
-            record["error"] = "invalid_step"
-            results.append(record)
-            continue
-
-        tool = raw_step.get("tool")
-        record.update(
-            {
-                "tool": tool,
-                "covers": raw_step.get("covers") or [],
-                "tests": raw_step.get("tests") or [],
-                "pass_if": raw_step.get("pass_if"),
-                "fail_if": raw_step.get("fail_if"),
-                "why": raw_step.get("why"),
-            }
-        )
-
-        args = raw_step.get("args")
-        if not isinstance(args, dict):
-            record["status"] = "error"
-            record["error"] = "invalid_args"
-            results.append(record)
-            continue
-
-        try:
-            if tool == "price_window":
-                res = tool_price_window(
-                    str(args["ticker"]).strip(),
-                    str(args["from"]).strip(),
-                    str(args["to"]).strip(),
-                    str(args.get("interval", "1d")).strip() or "1d",
-                )
-            elif tool == "compute_indicators":
-                res = tool_compute_indicators(
-                    str(args["ticker"]).strip(),
-                    int(args.get("window_days", 60)),
-                )
-            elif tool == "trend_strength":
-                res = tool_trend_strength(
-                    str(args["ticker"]).strip(),
-                    int(args.get("lookback_days", 30)),
-                )
-            elif tool == "volatility_state":
-                res = tool_volatility_state(
-                    str(args["ticker"]).strip(),
-                    int(args.get("days", 20)),
-                    int(args.get("baseline_days", 10)),
-                )
-            elif tool == "support_resistance_check":
-                res = tool_support_resistance_check(
-                    str(args["ticker"]).strip(),
-                    int(args.get("days", 30)),
-                )
-            elif tool == "bollinger_breakout_scan":
-                res = tool_bollinger_breakout_scan(
-                    str(args["ticker"]).strip(),
-                    int(args.get("days", 20)),
-                )
-            elif tool == "obv_trend":
-                res = tool_obv_trend(
-                    str(args["ticker"]).strip(),
-                    int(args.get("lookback_days", 30)),
-                )
-            elif tool == "mfi_flow":
-                res = tool_mfi_flow(
-                    str(args["ticker"]).strip(),
-                    int(args.get("period", 14)),
-                )
-            else:
-                # If a non-technical tool sneaks in, don’t fail the whole block — skip it.
-                record["status"] = "skipped"
-                record["error"] = "non-technical-tool"
-                results.append(record)
-                continue
-
-            record["status"] = "ok"
-            record["result"] = res
-        except Exception as exc:  # noqa: BLE001
-            record["status"] = "error"
-            record["error"] = str(exc)
-        results.append(record)
-
-    insights, summary_lines = _summarize_technical_results(results)
-    status = "ok"
-    if not results:
-        status = "empty"
-    elif any(r.get("status") == "error" for r in results):
-        status = "partial"
-
-    payload = {
-        "steps": steps,
-        "results": results,
-        "insights": insights,
-        "summary_lines": summary_lines,
-        "status": status,
-    }
-    return payload, summary_lines
-
-
-def _run_sentiment_block(
-    ticker: str,
-    article_time: str,
-    *,
-    channel: str = "social",
-    lookback_days: int = 7,
-    burst_hours: int = 6,
-    conversation_payload: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    hub = _get_conversation_hub()
-    if not hub:
-        raise RuntimeError("conversation-hub-unavailable")
-
-    store = getattr(hub, "store", None)
-    if store is None:
-        raise RuntimeError("conversation-store-unavailable")
-
-    norm_ticker = (ticker or "").strip().upper()
-    if not norm_ticker:
-        raise ValueError("ticker-required")
-
-    try:
-        score = compute_ticker_signal(
-            store,
-            norm_ticker,
-            article_time,
-            lookback_days=lookback_days,
-            peers=None,
-            channel_filter=channel,
-            burst_hours=burst_hours,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "error": f"hub-score-failed: {exc}",
-            "ticker": norm_ticker,
-            "as_of": article_time,
-            "channel": channel,
-            "window_days": lookback_days,
-        }
-
-    signal = score.get("signal") if isinstance(score, dict) else None
-    if not isinstance(signal, dict):
-        signal = {}
-
-    des_raw = signal.get("des_raw") if isinstance(signal.get("des_raw"), (int, float)) else None
-    des_sector = signal.get("des_sector") if isinstance(signal.get("des_sector"), (int, float)) else None
-    des_idio = signal.get("des_idio") if isinstance(signal.get("des_idio"), (int, float)) else None
-    confidence = signal.get("confidence") if isinstance(signal.get("confidence"), (int, float)) else None
-    n_deltas_raw = signal.get("n_deltas")
-    n_deltas = int(n_deltas_raw) if isinstance(n_deltas_raw, (int, float)) else None
-
-    recent_deltas = _fetch_recent_deltas(store, norm_ticker, article_time, limit=6)
-
-    payload: Dict[str, Any] = {
-        "ticker": norm_ticker,
-        "as_of": article_time,
-        "channel": score.get("channel") if isinstance(score.get("channel"), str) else channel,
-        "window_days": score.get("window_days") if isinstance(score.get("window_days"), int) else lookback_days,
-        "burst_hours": score.get("burst_hours") if isinstance(score.get("burst_hours"), int) else burst_hours,
-        "des_raw": des_raw,
-        "des_sector": des_sector,
-        "des_idio": des_idio,
-        "confidence": confidence,
-        "n_deltas": n_deltas,
-        "DES_adj": (des_idio or 0.0) * (confidence or 0.0) if (des_idio is not None and confidence is not None) else None,
-        "raw": score,
-    }
-
-    if recent_deltas:
-        payload["deltas"] = recent_deltas
-        payload["latest_delta"] = recent_deltas[-1]
-
-    if isinstance(conversation_payload, dict):
-        delta = conversation_payload.get("delta")
-        if isinstance(delta, dict):
-            who = delta.get("who") or []
-            matches = norm_ticker in {str(w).strip().upper() for w in who if isinstance(w, str)}
-            if matches:
-                payload["article_delta"] = {
-                    "t": delta.get("t"),
-                    "sum": delta.get("sum"),
-                    "dir": delta.get("dir"),
-                    "impact": delta.get("impact"),
-                    "why": delta.get("why"),
-                    "chan": delta.get("chan"),
-                    "cat": delta.get("cat"),
-                    "src": delta.get("src"),
-                    "url": delta.get("url"),
-                }
-
-    try:
-        narrative = hub.ask_as_of(
-            norm_ticker,
-            "Summarize tone and catalysts.",
-            article_time,
-        )
-    except Exception as exc:  # noqa: BLE001
-        payload["narrative_error"] = f"hub-narrative-failed: {exc}"
-    else:
-        if narrative:
-            payload["narrative"] = narrative
-
-    return payload
-
-def _trim(s: str, n: int) -> str:
-    if s and len(s) > n:
-        return s[:n] + "\n…[truncated]…"
-    return s or ""
-
-def _safe_bool_env(flag: bool) -> str:
-    return "1" if flag else "0"
 
 
 class _CallbackWriter(io.TextIOBase):
