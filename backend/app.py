@@ -2252,6 +2252,62 @@ def _worker_refresh_summaries(job_id: str):
     oracle_handles_council = bool(job.get("oracle_handles_council"))
     warmup_cutoff_iso = str(job.get("oracle_warmup_cutoff") or datetime.now(timezone.utc).isoformat())
 
+    def _record_new_post(pid: str, title: str, interest_score: Optional[float]) -> None:
+        if not collect_new_posts:
+            return
+
+        safe_pid = (pid or "").strip()
+        if not safe_pid:
+            return
+
+        def mutate(data: Dict[str, Any]) -> None:
+            entries = list(data.get("new_posts") or [])
+            entry: Dict[str, Any] = {"post_id": safe_pid}
+            safe_title = (title or "").strip()
+            if safe_title:
+                entry["title"] = safe_title
+            if interest_score is not None:
+                entry["interest_score"] = interest_score
+            entries.append(entry)
+            data["new_posts"] = entries
+
+        _job_mutate(job_id, mutate)
+
+    def _backfill_interest_scores(conn: sqlite3.Connection) -> None:
+        if not _interest_supported():
+            return
+        rows = _q_all(
+            conn,
+            """
+            SELECT DISTINCT s.post_id, COALESCE(p.title, '') AS title
+            FROM stages s
+            JOIN posts p ON p.post_id = s.post_id
+            LEFT JOIN council_stage_interest ci ON ci.post_id = s.post_id
+            WHERE s.stage = 'summariser'
+              AND (
+                    ci.post_id IS NULL
+                 OR LOWER(COALESCE(ci.status, '')) != 'ok'
+                 OR LOWER(COALESCE(ci.error_code, '')) = 'price_data_unavailable'
+                 OR INSTR(LOWER(COALESCE(ci.interest_why, '')), 'price data being unavailable for ticker') > 0
+              )
+            ORDER BY datetime(COALESCE(p.scraped_at, p.posted_at)) DESC
+            """,
+            tuple(),
+        )
+        if not rows:
+            return
+        total = len(rows)
+        _interest_schedule(total)
+        _job_append_log(job_id, f"→ backfilling interest scores for {total} post(s)")
+        for row in rows:
+            if not _ensure_not_cancelled():
+                return
+            pid = row["post_id"]
+            title = row["title"] or ""
+            _interest_before_run("Interest backfill", pid, title)
+            _run_interest_for_post(pid, title)
+            _interest_after_run()
+
 
     def _run_oracle_loop(conn: sqlite3.Connection, summarised: Set[str]) -> None:
         if not oracle_base_url:
@@ -3053,62 +3109,6 @@ def _worker_refresh_summaries(job_id: str):
             ref_post_id = pid or None
             pending_article = None
 
-
-        def _record_new_post(pid: str, title: str, interest_score: Optional[float]) -> None:
-            if not collect_new_posts:
-                return
-
-            safe_pid = (pid or "").strip()
-            if not safe_pid:
-                return
-
-            def mutate(data: Dict[str, Any]) -> None:
-                entries = list(data.get("new_posts") or [])
-                entry: Dict[str, Any] = {"post_id": safe_pid}
-                safe_title = (title or "").strip()
-                if safe_title:
-                    entry["title"] = safe_title
-                if interest_score is not None:
-                    entry["interest_score"] = interest_score
-                entries.append(entry)
-                data["new_posts"] = entries
-
-            _job_mutate(job_id, mutate)
-
-        def _backfill_interest_scores(conn: sqlite3.Connection) -> None:
-            if not _interest_supported():
-                return
-            rows = _q_all(
-                conn,
-                """
-                SELECT DISTINCT s.post_id, COALESCE(p.title, '') AS title
-                FROM stages s
-                JOIN posts p ON p.post_id = s.post_id
-                LEFT JOIN council_stage_interest ci ON ci.post_id = s.post_id
-                WHERE s.stage = 'summariser'
-                  AND (
-                        ci.post_id IS NULL
-                     OR LOWER(COALESCE(ci.status, '')) != 'ok'
-                     OR LOWER(COALESCE(ci.error_code, '')) = 'price_data_unavailable'
-                     OR INSTR(LOWER(COALESCE(ci.interest_why, '')), 'price data being unavailable for ticker') > 0
-                  )
-                ORDER BY datetime(COALESCE(p.scraped_at, p.posted_at)) DESC
-                """,
-                tuple(),
-            )
-            if not rows:
-                return
-            total = len(rows)
-            _interest_schedule(total)
-            _job_append_log(job_id, f"→ backfilling interest scores for {total} post(s)")
-            for row in rows:
-                if not _ensure_not_cancelled():
-                    return
-                pid = row["post_id"]
-                title = row["title"] or ""
-                _interest_before_run("Interest backfill", pid, title)
-                _run_interest_for_post(pid, title)
-                _interest_after_run()
 
     def _stream_summariser(post_id: str, title: str) -> Tuple[bool, Optional[str], List[str]]:
         log_lines: List[str] = []
