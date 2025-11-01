@@ -294,6 +294,9 @@ export type CouncilJob = {
   current_started_at?: number | null
   current_article_tokens?: number | null
   current_summary_tokens?: number | null
+  current_stage?: string | null
+  current_stage_label?: string | null
+  current_stage_detail?: string | null
 }
 
 export async function startCouncilAnalysis(options: {

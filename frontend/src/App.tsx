@@ -412,9 +412,30 @@ export default function App() {
   const oracleControlsDisabled =
     working || jobActive || councilJobActive || councilJobBusy || analyseNewActive || analyseNewCancelRequested
   const oracleStatusIndicator = useMemo(() => {
+    if (councilProgress) {
+      const stageLabelText = councilStageLabel?.trim()
+      const manualParts: string[] = []
+      if (stageLabelText) {
+        manualParts.push(`Processing ${stageLabelText}`)
+      } else {
+        manualParts.push('Processing council analysis')
+      }
+      if (councilTotal > 0) {
+        manualParts.push(`${councilDone}/${councilTotal} complete`)
+      }
+      const manualText = manualParts.length > 0 ? manualParts.join(' — ') : 'Processing council analysis'
+      return {
+        variant: 'warning' as OracleStatusVariant,
+        text: truncateOracleStatus(`Council: ${manualText}`),
+      }
+    }
+
     if (councilJobActive) {
       const stageInfo = extractLatestCouncilStage(councilLog)
-      let stageLabel = stageInfo?.stage ?? ''
+      const preferredLabel = (councilJob?.current_stage_label ?? '').trim()
+      let stageLabel = preferredLabel
+        ? normalizeCouncilStageLabel(preferredLabel)
+        : stageInfo?.stage ?? ''
       if (!stageLabel) {
         if (councilJob?.status === 'queued') {
           stageLabel = 'Queued'
@@ -430,9 +451,14 @@ export default function App() {
         ? messageText.split(' — ').map((part) => part.trim()).filter((part) => part.length > 0)
         : []
 
-      const detailParts = [stageInfo?.detail?.trim() ?? '', ...messageParts]
+      const detailParts: string[] = []
+      const stageDetail = (councilJob?.current_stage_detail ?? '').trim()
+      if (stageDetail) detailParts.push(stageDetail)
+      const logDetail = stageInfo?.detail?.trim()
+      if (logDetail) detailParts.push(logDetail)
+      detailParts.push(...messageParts)
 
-      if (!stageInfo?.detail && messageParts.length === 0) {
+      if (!stageDetail && !logDetail && messageParts.length === 0) {
         const currentText = (councilJob?.current ?? '').trim()
         if (currentText) detailParts.push(currentText)
       }
@@ -528,6 +554,10 @@ export default function App() {
       text: truncateOracleStatus(text),
     }
   }, [
+    councilProgress,
+    councilStageLabel,
+    councilDone,
+    councilTotal,
     councilJobActive,
     councilLog,
     councilJob?.message,
@@ -535,6 +565,9 @@ export default function App() {
     councilJob?.remaining,
     councilJob?.current_mode,
     councilJob?.status,
+    councilJob?.current_stage,
+    councilJob?.current_stage_label,
+    councilJob?.current_stage_detail,
     oracleStatus,
     oracleIdleInfo?.pollSeconds,
     oracleIdleInfo?.idleSince,
@@ -1235,6 +1268,9 @@ export default function App() {
                   log_tail: [],
                   message: '',
                   error: undefined,
+                  current_stage: null,
+                  current_stage_label: null,
+                  current_stage_detail: null,
                 }
           )
           const activeStatus = active.status === 'queued' || active.status === 'running' || active.status === 'cancelling'
@@ -1456,6 +1492,9 @@ export default function App() {
           current_mode: null,
           current_article_tokens: null,
           current_summary_tokens: null,
+          current_stage: null,
+          current_stage_label: null,
+          current_stage_detail: null,
         })
         setCouncilJobBusy(res.total > 0)
       } catch (err: any) {
