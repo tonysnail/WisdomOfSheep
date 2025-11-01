@@ -566,3 +566,18 @@ def test_refresh_summaries_worker_ingests_conversation_hub(temp_db, tmp_path, mo
         ).fetchall()
 
     assert {row["stage"] for row in rows} >= {"summariser"}
+
+
+def test_refresh_summaries_active_returns_204_when_missing_job(tmp_path, monkeypatch):
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+
+    job_id = "job-missing"
+    monkeypatch.setattr(backend_app, "JOBS_DIR", jobs_dir, raising=False)
+    monkeypatch.setattr(backend_app, "ACTIVE_JOB_ID", job_id, raising=False)
+
+    response = backend_app.get_active_refresh_summaries()
+
+    assert hasattr(response, "status_code")
+    assert response.status_code == 204
+    assert backend_app.ACTIVE_JOB_ID is None
