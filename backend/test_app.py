@@ -4,6 +4,7 @@ import time
 from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
 
 from backend import app as backend_app
 from council import interest_score
@@ -566,3 +567,71 @@ def test_refresh_summaries_worker_ingests_conversation_hub(temp_db, tmp_path, mo
         ).fetchall()
 
     assert {row["stage"] for row in rows} >= {"summariser"}
+
+
+def test_refresh_summaries_active_returns_204_when_missing_job(tmp_path, monkeypatch):
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+
+    job_id = "job-missing"
+    monkeypatch.setattr(backend_app, "JOBS_DIR", jobs_dir, raising=False)
+    monkeypatch.setattr(backend_app, "ACTIVE_JOB_ID", job_id, raising=False)
+
+    response = backend_app.get_active_refresh_summaries()
+
+    assert hasattr(response, "status_code")
+    assert response.status_code == 204
+    assert backend_app.ACTIVE_JOB_ID is None
+
+
+def test_refresh_summaries_active_endpoint_is_not_shadowed(tmp_path, monkeypatch):
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+
+    job_id = "job-missing"
+    monkeypatch.setattr(backend_app, "JOBS_DIR", jobs_dir, raising=False)
+    monkeypatch.setattr(backend_app, "ACTIVE_JOB_ID", job_id, raising=False)
+
+    client = TestClient(backend_app.app)
+    response = client.get("/api/refresh-summaries/active")
+
+    assert response.status_code == 204
+    assert backend_app.ACTIVE_JOB_ID is None
+
+
+def test_refresh_summaries_active_returns_payload(tmp_path, monkeypatch):
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(backend_app, "JOBS_DIR", jobs_dir, raising=False)
+
+    job_id = "job-active"
+    now = time.time()
+    backend_app._job_save(
+        {
+            "id": job_id,
+            "status": "running",
+            "total": 5,
+            "done": 2,
+            "phase": "processing",
+            "current": "post-123",
+            "log_tail": ["line"],
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+
+    monkeypatch.setattr(backend_app, "ACTIVE_JOB_ID", job_id, raising=False)
+
+    client = TestClient(backend_app.app)
+    response = client.get("/api/refresh-summaries/active")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == job_id
+    assert data["job_id"] == job_id
+    assert data["status"] == "running"
+    assert data["total"] == 5
+    assert data["done"] == 2
+    assert data["log_tail"] == ["line"]
+    assert data["message"].startswith("processing 2/5")
