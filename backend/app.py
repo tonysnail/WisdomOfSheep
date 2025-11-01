@@ -3418,6 +3418,9 @@ def _worker_council_analysis(job_id: str) -> None:
         status="running",
         started_at=job.get("started_at") or time.time(),
         remaining=len(queue),
+        current_stage=None,
+        current_stage_label=None,
+        current_stage_detail=None,
     )
 
     def _ensure_not_cancelled(current_post: Optional[str] = None) -> bool:
@@ -3451,6 +3454,9 @@ def _worker_council_analysis(job_id: str) -> None:
                 current_started_at=None,
                 current_article_tokens=None,
                 current_summary_tokens=None,
+                current_stage=None,
+                current_stage_label=None,
+                current_stage_detail=None,
             )
             return False
         return True
@@ -3487,9 +3493,10 @@ def _worker_council_analysis(job_id: str) -> None:
                 eta_seconds = None
 
             article_started_at = time.time()
+            current_descriptor = f"{post_id} — {display_title}".rstrip(" —")
             _job_update_fields(
                 job_id,
-                current=f"{post_id} — {display_title}",
+                current=current_descriptor,
                 remaining=remaining,
                 current_mode=mode,
                 current_started_at=article_started_at,
@@ -3516,6 +3523,9 @@ def _worker_council_analysis(job_id: str) -> None:
                     current_article_tokens=None,
                     current_summary_tokens=None,
                     current_mode=None,
+                    current_stage=None,
+                    current_stage_label=None,
+                    current_stage_detail=None,
                 )
                 _job_increment(job_id, "done", 1)
                 continue
@@ -3530,6 +3540,9 @@ def _worker_council_analysis(job_id: str) -> None:
                     current_article_tokens=None,
                     current_summary_tokens=None,
                     current_mode=None,
+                    current_stage=None,
+                    current_stage_label=None,
+                    current_stage_detail=None,
                 )
                 _job_increment(job_id, "done", 1)
                 continue
@@ -3539,6 +3552,12 @@ def _worker_council_analysis(job_id: str) -> None:
                 if not _ensure_not_cancelled(post_id):
                     return
                 label = _council_stage_label(stage)
+                _job_update_fields(
+                    job_id,
+                    current_stage=stage,
+                    current_stage_label=label,
+                    current_stage_detail=current_descriptor,
+                )
                 _job_append_log(job_id, f"→ {label} for {post_id}")
                 err_output = ""
                 try:
@@ -3581,6 +3600,9 @@ def _worker_council_analysis(job_id: str) -> None:
                 current_started_at=None,
                 current_article_tokens=None,
                 current_summary_tokens=None,
+                current_stage=None,
+                current_stage_label=None,
+                current_stage_detail=None,
             )
             active_post_id = None
             active_post_cleared_on_cancel = False
@@ -3596,6 +3618,9 @@ def _worker_council_analysis(job_id: str) -> None:
             current_started_at=None,
             current_article_tokens=None,
             current_summary_tokens=None,
+            current_stage=None,
+            current_stage_label=None,
+            current_stage_detail=None,
         )
     except Exception as exc:  # noqa: BLE001
         _job_update_fields(
@@ -3608,6 +3633,9 @@ def _worker_council_analysis(job_id: str) -> None:
             current_started_at=None,
             current_article_tokens=None,
             current_summary_tokens=None,
+            current_stage=None,
+            current_stage_label=None,
+            current_stage_detail=None,
         )
     finally:
         _job_update_fields(job_id, queue=[])
@@ -3798,6 +3826,9 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
         "current_started_at": None,
         "current_article_tokens": None,
         "current_summary_tokens": None,
+        "current_stage": None,
+        "current_stage_label": None,
+        "current_stage_detail": None,
     }
 
     _job_save(job_data)
@@ -3841,6 +3872,9 @@ def start_council_analysis(payload: CouncilAnalysisStartRequest):
             current_started_at=None,
             current_article_tokens=None,
             current_summary_tokens=None,
+            current_stage=None,
+            current_stage_label=None,
+            current_stage_detail=None,
         )
         with COUNCIL_JOB_LOCK:
             if ACTIVE_COUNCIL_JOB_ID == job_id:
